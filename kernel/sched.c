@@ -1,12 +1,15 @@
 /* NovaOS - round-robin scheduler.
  * Context switch is done by saving/restoring ESP on each task's private
- * stack; the IRQ stub's iret returns into the resumed context.
+ * stack; the IRQ stub's iret returns into the resumed context.  User
+ * tasks carry their own page directory (cr3) and switching between
+ * address spaces reloads CR3 (v1.0: per-process page tables + COW).
  */
 #include "sched.h"
 #include "kheap.h"
 #include "mm.h"
 #include "gdt.h"
 #include "user.h"
+#include "paging.h"
 #include "io.h"
 #include "string.h"
 #include "vga.h"
@@ -74,13 +77,14 @@ u32 task_create(const char *name, task_fn fn) {
     return t->pid;
 }
 
-u32 task_create_user(const char *name, u32 entry) {
+u32 task_create_user(const char *name, u32 entry, u32 cr3) {
     if (task_count >= MAX_TASKS) return 0;
     task_t *t = &tasks[task_count];
     t->pid = next_pid++;
     t->state = 1;
     t->flags = TASK_USER;
     t->stack_bottom = 0;              /* interrupts use the shared TSS stack */
+    t->cr3 = cr3;
     strncpy(t->name, name, sizeof(t->name) - 1);
     t->name[sizeof(t->name) - 1] = '\0';
     t->slice_left = 5;
@@ -89,9 +93,37 @@ u32 task_create_user(const char *name, u32 entry) {
     return t->pid;
 }
 
+/* fork(2): clone the current user task.  The child gets a COW copy of
+ * the parent's address space and resumes at the same instruction with
+ * eax = 0 (the parent sees the child pid from the syscall return). */
+u32 task_fork_user(const char *name, u32 parent_esp, u32 parent_cr3) {
+    if (task_count >= MAX_TASKS) return 0;
+    u32 child_cr3 = paging_fork_addr_space(parent_cr3);
+    if (!child_cr3) return 0;
+    task_t *t = &tasks[task_count];
+    t->pid = next_pid++;
+    t->state = 1;
+    t->flags = TASK_USER;
+    t->stack_bottom = 0;
+    t->cr3 = child_cr3;
+    strncpy(t->name, name, sizeof(t->name) - 1);
+    t->name[sizeof(t->name) - 1] = '\0';
+    t->slice_left = 5;
+    /* child frame: same return context, eax slot = 0 */
+    t->esp = parent_esp;
+    *(u32*)(t->esp + 44) = 0;         /* pushad eax slot in the frame */
+    task_count++;
+    return t->pid;
+}
+
 static void switch_to(u32 next) {
     if (!sched_ready) { current = next; return; }
     u32 old = current;
+    /* reload CR3 when entering a user task (or leaving one) */
+    if (tasks[old].flags == TASK_USER || tasks[next].flags == TASK_USER) {
+        u32 cr3 = (tasks[next].flags == TASK_USER) ? tasks[next].cr3 : KERNEL_PD;
+        paging_switch(cr3);
+    }
     __asm__ volatile (
         "mov %%esp, %0\n\t"
         "mov %1, %%esp\n\t"
@@ -126,6 +158,8 @@ void sched_tick(void) {
 
 u32 sched_current_pid(void) { return tasks[current].pid; }
 
+task_t *sched_current_task(void) { return &tasks[current]; }
+
 u32 sched_task_count(void) {
     u32 n = 0;
     for (u32 i = 0; i < task_count; i++)
@@ -137,10 +171,18 @@ u32 sched_task_count(void) {
  * ready task by unwinding its frame directly (never returns here). */
 void sched_exit_current(void) {
     tasks[current].state = 0;
+    /* release the exiting process's address space (COW refcounts drop,
+     * private frames are freed) */
+    if (tasks[current].flags == TASK_USER && tasks[current].cr3)
+        paging_destroy_addr_space(tasks[current].cr3);
     for (u32 i = 1; i <= MAX_TASKS; i++) {
         u32 next = (current + i) % MAX_TASKS;
         if (tasks[next].state) {
             tasks[next].slice_left = 5;
+            if (tasks[next].flags == TASK_USER)
+                paging_switch(tasks[next].cr3);
+            else
+                paging_switch(KERNEL_PD);
             __asm__ volatile (
                 "mov %0, %%esp\n\t"
                 "pop %%gs\n\t"

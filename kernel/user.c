@@ -2,6 +2,7 @@
 #include "user.h"
 #include "gdt.h"
 #include "sched.h"
+#include "paging.h"
 #include "string.h"
 #include "printf.h"
 #include "serial.h"
@@ -33,7 +34,9 @@ void user_init(void) {
 
 /* ------------------------------------------------------------------ */
 /* Minimal ELF32 loader (ET_EXEC only, EM_386).  Loads PT_LOAD         */
-/* segments into the user window and returns the entry point.          */
+/* segments into the user window of the given address space and        */
+/* returns the entry point.  Pages are demand-mapped (frame allocated  */
+/* on first touch by the loader, not lazily by the CPU).               */
 /* ------------------------------------------------------------------ */
 struct elf32_hdr {
     u8  e_ident[16];
@@ -48,7 +51,7 @@ struct elf32_phdr {
 
 #define PT_LOAD 1
 
-u32 user_load_elf(const u8 *img, u32 size) {
+u32 user_load_elf(u32 cr3, const u8 *img, u32 size) {
     if (size < sizeof(struct elf32_hdr)) return 0;
     const struct elf32_hdr *h = (const struct elf32_hdr*)img;
     if (h->e_ident[0] != 0x7F || h->e_ident[1] != 'E' ||
@@ -64,6 +67,9 @@ u32 user_load_elf(const u8 *img, u32 size) {
         if (ph[i].p_vaddr < USER_TEXT_BASE) return 0;
         if (ph[i].p_vaddr + ph[i].p_memsz > USER_STACK_TOP) return 0;
         if (ph[i].p_offset + ph[i].p_filesz > size) return 0;
+        /* allocate the pages of this segment in the new address space */
+        if (!paging_map_user_region(cr3, ph[i].p_vaddr, ph[i].p_memsz))
+            return 0;
         memcpy((void*)ph[i].p_vaddr, img + ph[i].p_offset, ph[i].p_filesz);
         if (ph[i].p_memsz > ph[i].p_filesz)
             memset((void*)(ph[i].p_vaddr + ph[i].p_filesz), 0,
@@ -73,7 +79,27 @@ u32 user_load_elf(const u8 *img, u32 size) {
 }
 
 u32 user_spawn(const char *name, const u8 *img, u32 size) {
-    u32 entry = user_load_elf(img, size);
-    if (!entry) return 0;
-    return task_create_user(name, entry);
+    u32 cr3 = paging_create_addr_space();
+    if (!cr3) return 0;
+
+    u32 old = paging_get_cr3();
+    paging_switch(cr3);                      /* copy into the new space */
+
+    u32 entry = user_load_elf(cr3, img, size);
+    if (!entry) {
+        paging_switch(old);
+        paging_destroy_addr_space(cr3);
+        return 0;
+    }
+    /* user stack: 8KB below USER_STACK_TOP */
+    if (!paging_map_user_region(cr3, USER_STACK_TOP - 0x2000, 0x2000)) {
+        paging_switch(old);
+        paging_destroy_addr_space(cr3);
+        return 0;
+    }
+
+    u32 pid = task_create_user(name, entry, cr3);
+    paging_switch(old);
+    if (!pid) paging_destroy_addr_space(cr3);
+    return pid;
 }

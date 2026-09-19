@@ -21,6 +21,19 @@ static const char *exceptions[32] = {
 
 void isr_common_handler(struct regs *r) {
     if (r->int_no < 32) {
+        /* page fault: v1.0 resolves copy-on-write writes from ring 3
+         * (shared read-only user pages get copied on first write). */
+        if (r->int_no == 14 && (r->err_code & 0x4)) {
+            u32 cr2;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            extern int paging_cow_fault(u32 cr2, u32 err);
+            if (paging_cow_fault(cr2, r->err_code))
+                return;                       /* iret retries the faulting insn */
+            kprintf("user process killed: bad page fault addr 0x%x err 0x%x eip 0x%x\n",
+                    cr2, r->err_code, r->eip);
+            extern void sched_exit_current(void);
+            sched_exit_current();             /* never returns */
+        }
         /* CPU exception - report and halt */
         vga_write("\n[PANIC] Exception: ", 0x4C);
         vga_write(exceptions[r->int_no], 0x4C);
