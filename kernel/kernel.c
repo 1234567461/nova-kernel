@@ -65,7 +65,7 @@ static void try_load_user_app(void) {
 
 void kernel_main(void) {
     serial_init();
-    kprintf("NovaOS kernel v0.5 booting...\n");
+    kprintf("NovaOS kernel v1.0 booting...\n");
 
     gdt_init();
     kprintf("gdt: ok\n");
@@ -89,7 +89,7 @@ void kernel_main(void) {
             mm_free_frames() * 4, HEAP_START, HEAP_END);
 
     paging_init();
-    kprintf("paging: 4MB map, user window 0x200000-0x2FFFFF U/S\n");
+    kprintf("paging: per-process page tables + COW (v1.0)\n");
 
     user_init();
 
@@ -114,9 +114,9 @@ void kernel_main(void) {
     vga_init();
     vga_write("\n", 0x0F);
     vga_write("===============================================\n", 0x09);
-    vga_write("  NovaOS v0.5 - self-made operating system\n", 0x0F);
+    vga_write("  NovaOS v1.0 - self-made operating system\n", 0x0F);
     vga_write("  boot: stage1 -> stage2 -> pmode -> paging\n", 0x0F);
-    vga_write("  ring3 userland + FAT12 disk + mouse GUI\n", 0x0F);
+    vga_write("  per-process page tables + COW fork\n", 0x0F);
     vga_write("  type 'help', 'gui', 'ls', 'cat', 'run'\n", 0x0F);
     vga_write("===============================================\n", 0x09);
     vga_write("\n", 0x0F);

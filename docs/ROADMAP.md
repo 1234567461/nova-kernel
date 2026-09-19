@@ -10,7 +10,7 @@
 - [x] 内置 shell + mode13h 图形桌面（窗口/任务栏）
 - 交付物：`make` → `build/novaos.img`，QEMU 引导，`gui` 命令进桌面
 
-## v0.5 用户态 + 文件系统  ✅（本仓库当前状态）
+## v0.5 用户态 + 文件系统  ✅
 - [x] 用户态进程：TSS + ring3 + int 0x80 gate（DPL3）+ 最小 ELF32 加载器
 - [x] 内存保护：页表 U/S 位拆分（内核 supervisor / 用户窗口 0x200000-0x2FFFFF）
 - [x] 文件系统：FAT12 读取（BPB/根目录/簇链）+ ATA PIO（secondary master）驱动
@@ -19,10 +19,19 @@
 - [x] 演示链路：启动自动从 FAT 盘加载 hello.elf → ring3 运行 → syscall → exit
 - 交付物：`make` → `build/novaos.img` + `build/data.img`（FAT12 数据盘），
   QEMU `-fda novaos.img -fdb data.img`；shell 里 `ls` / `cat <file>` / `run <name>`
-- 明确延后：RTC 实时钟、按进程独立页表 + COW（当前单地址空间，ring3 隔离靠 U/S 位）、FAT16/32
 
-## v1.0 自研图形栈 + 网络（下一步）
-- [ ] 按进程页表 + copy-on-write（从 v0.5 的单地址空间升级）
+## v1.0 按进程页表 + COW  ✅（本仓库当前状态）
+- [x] 每进程独立页目录 + 页表（内核区域继承映射，用户窗口私有）
+- [x] fork() 系统调用（nr 3）：COW 克隆地址空间，父得子 pid、子得 0
+- [x] 写时复制：共享页只读，#PF 处理复制帧（仅限 ring3 写）
+- [x] 用户页引用计数（mm_ref_inc/dec）：最后一引用释放帧，进程 exit 回收地址空间
+- [x] 调度器切换 CR3（用户任务间、用户/内核间）
+- [x] 物理帧分配器保留区治理：避开内核镜像与堆，可用帧约 464 个
+- 演示：hello.elf fork 后父子各自写 `.data` 全局变量 → 触发 COW → 各自独立副本
+- 交付物：`make` → `build/novaos.img` + `build/data.img`，`run hello` 看 fork/COW 输出
+- 明确延后：VBE 高分辨率、独立内核页表（目前用户页表继承内核 PTE）、exec/地址空间替换
+
+## v1.5 自研图形栈 + 网络（下一步）
 - [ ] VBE 高分辨率线性帧缓冲（1024x768x32）
 - [ ] 自研合成器/窗口管理器（多窗口、分层合成）
 - [ ] RTC 实时钟、FAT16/32、ATA DMA

@@ -52,9 +52,9 @@ static void cmd_echo(char *rest) {
 
 static void cmd_about(void) {
     vga_write(
-        "NovaOS v0.5 - self-made operating system\n"
+        "NovaOS v1.0 - self-made operating system\n"
         "layers: bootloader, GDT, IDT, PIC, PIT, keyboard, mouse, VGA,\n"
-        "        paging (U/S split), phys allocator, heap, scheduler,\n"
+        "        per-process paging + COW fork, phys allocator, heap, sched,\n"
         "        syscalls, ring3 userland, FAT12 reader, GUI desktop\n",
         0x0F);
 }
