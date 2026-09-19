@@ -77,7 +77,9 @@ void idt_init(void) {
     int n = sizeof(stubs) / sizeof(stubs[0]);
     for (int i = 0; i < n; i++) {
         u8 vec = (i < 48) ? (u8)i : 128;
-        idt_set_entry(vec, (u32)stubs[i], 0x08, 0x8E);  /* present, ring0 int gate */
+        /* ring0 int gate; vector 128 (int 0x80) is opened to ring 3 */
+        u8 flags = (vec == 128) ? 0xEE : 0x8E;
+        idt_set_entry(vec, (u32)stubs[i], 0x08, flags);
     }
 
     ip.limit = (u16)(sizeof(idt) - 1);

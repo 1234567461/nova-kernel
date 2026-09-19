@@ -5,6 +5,7 @@
  *   nr 2: sys_exit(code)
  */
 #include "syscall.h"
+#include "sched.h"
 #include "vga.h"
 #include "serial.h"
 #include "io.h"
@@ -15,7 +16,6 @@
 
 static u32 sys_write(u32 fd, const char *buf, u32 len) {
     (void)fd;
-    vga_write("[sys]", 0x0B);
     for (u32 i = 0; i < len; i++) {
         vga_putc(buf[i], 0x0F);
         serial_putc(buf[i]);
@@ -29,16 +29,13 @@ void syscall_dispatch(struct regs *r) {
         r->eax = sys_write(r->ebx, (const char*)r->ecx, r->edx);
         break;
     case NR_GETPID:
-        r->eax = 1;   /* kernel demo pid; user processes later */
+        r->eax = sched_current_pid();
         break;
     case NR_EXIT:
-        /* in this milestone, exit stops the kernel with a message */
-        vga_write("\n[sys] exit() called - halting\n", 0x0C);
-        cli();
-        for (;;) hlt();
+        sched_exit_current();      /* switches away, never returns */
         break;
     default:
-        r->eax = (u32)-1;   /* ENOSYS */
+        r->eax = (u32)-1;          /* ENOSYS */
         break;
     }
 }

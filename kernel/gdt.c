@@ -21,7 +21,7 @@ struct gdt_ptr {
     u32 base;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[3];
+static struct gdt_entry gdt[6];
 static struct gdt_ptr   gp;
 
 static void gdt_set_entry(int i, u32 base, u32 limit, u8 access, u8 gran) {
@@ -37,6 +37,9 @@ void gdt_init(void) {
     gdt_set_entry(0, 0, 0, 0, 0);                    /* null */
     gdt_set_entry(1, 0, 0xFFFFF, 0x9A, 0xCF);        /* code, 4GB */
     gdt_set_entry(2, 0, 0xFFFFF, 0x92, 0xCF);        /* data, 4GB */
+    gdt_set_entry(3, 0, 0xFFFFF, 0xFA, 0xCF);        /* user code, DPL3 */
+    gdt_set_entry(4, 0, 0xFFFFF, 0xF2, 0xCF);        /* user data, DPL3 */
+    /* entry 5 (TSS) is installed by user_init() via gdt_set_tss() */
     gp.limit = (u16)(sizeof(gdt) - 1);
     gp.base  = (u32)&gdt;
     __asm__ volatile ("lgdt %0" : : "m"(gp));
@@ -51,4 +54,8 @@ void gdt_init(void) {
         "mov %%ax, %%gs\n\t"
         "mov %%ax, %%ss\n\t"
         : : : "ax", "memory");
+}
+
+void gdt_set_tss(u32 base, u32 limit) {
+    gdt_set_entry(5, base, limit, 0x89, 0x00);   /* present, 32-bit TSS */
 }

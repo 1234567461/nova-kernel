@@ -6,17 +6,26 @@
 #define PAGE_TABLE 0xA000u
 #define PAGE_COUNT (MEM_END / 0x1000)   /* 1024 pages for 4MB */
 
+/* memory protection split (milestone 0.5):
+ *   0x000000-0x1FFFFF  kernel   (supervisor, no U/S)
+ *   0x200000-0x2FFFFF  user     (present | writable | user)
+ *   0x300000-0x3FFFFF  kernel   (heap, supervisor)            */
+#define USER_PG_START 512              /* 0x200000 */
+#define USER_PG_END   768              /* 0x300000 */
+
 void paging_init(void) {
     /* page directory: one entry pointing at our page table */
     memset((void*)PAGE_DIR, 0, 0x1000);
     memset((void*)PAGE_TABLE, 0, 0x1000);
 
     u32 *pt = (u32*)PAGE_TABLE;
-    for (u32 i = 0; i < PAGE_COUNT; i++)
-        pt[i] = (i * 0x1000) | 0x3;      /* present | writable */
+    for (u32 i = 0; i < PAGE_COUNT; i++) {
+        u32 flags = (i >= USER_PG_START && i < USER_PG_END) ? 0x7 : 0x3;
+        pt[i] = (i * 0x1000) | flags;  /* present | writable [| user] */
+    }
 
     u32 *pd = (u32*)PAGE_DIR;
-    pd[0] = PAGE_TABLE | 0x3;
+    pd[0] = PAGE_TABLE | 0x7;          /* PDE user so PTE U/S bits apply */
 
     __asm__ volatile ("mov %0, %%cr3" : : "r"((u32)PAGE_DIR));
     u32 cr0;
