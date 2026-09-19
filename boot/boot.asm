@@ -59,7 +59,7 @@ _start:
     mov si, KERNEL_START_SECTOR
     mov di, KERNEL_SEG
     mov ax, KERNEL_OFF
-    mov cx, 96                      # 96 sectors * 512 = 49152 bytes max kernel
+    mov cx, 200                     # 200 sectors * 512 = 102400 bytes max kernel
     call read_sectors
 
     mov si, offset msg_ok

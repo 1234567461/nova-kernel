@@ -20,7 +20,7 @@
 
     .set KERNEL_STAGING, 0x10000     # where stage1 put the kernel
     .set KERNEL_DEST,    0x100000    # final load address (1MB)
-    .set KERNEL_SIZE,    96*512      # must match stage1 sector count
+    .set KERNEL_SIZE,    200*512     # must match stage1 sector count
 
 _start:
     cli

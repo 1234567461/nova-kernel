@@ -38,5 +38,11 @@ SECTIONS
     . = . + 0x4000;
     kernel_stack_top = .;
 
+    /* System-call / interrupt stack: used as the ring-0 stack when a
+     * ring-3 process is interrupted (TSS.esp0 points here). */
+    . = ALIGN(4K);
+    . = . + 0x2000;
+    sys_stack_top = .;
+
     end = .;
 }

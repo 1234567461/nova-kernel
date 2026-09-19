@@ -2,6 +2,7 @@
 #include "gui.h"
 #include "vga.h"
 #include "keyboard.h"
+#include "mouse.h"
 #include "string.h"
 #include "printf.h"
 #include "serial.h"
@@ -46,11 +47,11 @@ static void win_draw_frame(window_t *w) {
 static void win_draw_content(window_t *w) {
     switch (w->type) {
     case WIN_ABOUT:
-        gfx_drawstring(w->x + 4, w->y + 16, "NovaOS v0.1", 0x04, 0x07);
+        gfx_drawstring(w->x + 4, w->y + 16, "NovaOS v0.5", 0x04, 0x07);
         gfx_drawstring(w->x + 4, w->y + 26, "Self-made kernel GUI", 0x01, 0x07);
         gfx_drawstring(w->x + 4, w->y + 36, "GDT/IDT/paging/mm", 0x01, 0x07);
-        gfx_drawstring(w->x + 4, w->y + 46, "sched/syscall", 0x01, 0x07);
-        gfx_drawstring(w->x + 4, w->y + 56, "Tab: focus, Esc: close", 0x0E, 0x07);
+        gfx_drawstring(w->x + 4, w->y + 46, "ring3/FAT12/mouse", 0x01, 0x07);
+        gfx_drawstring(w->x + 4, w->y + 56, "mouse: drag title bar", 0x0E, 0x07);
         break;
     case WIN_MEMINFO: {
         extern u32 mm_free_frames(void);
@@ -70,7 +71,7 @@ static void win_draw_content(window_t *w) {
     default:
         gfx_drawstring(w->x + 4, w->y + 16, "kernel: hello from C", 0x02, 0x07);
         gfx_drawstring(w->x + 4, w->y + 26, "boot: loader->pmode", 0x02, 0x07);
-        gfx_drawstring(w->x + 4, w->y + 36, "paging: 4MB identity", 0x02, 0x07);
+        gfx_drawstring(w->x + 4, w->y + 36, "user: ring3 process", 0x02, 0x07);
         break;
     }
 }
@@ -122,7 +123,31 @@ static void win_close(int idx) {
     redraw_all();
 }
 
+/* window whose title bar contains (x,y), or -1 */
+static int win_at_title(int x, int y) {
+    for (int i = MAX_WIN - 1; i >= 0; i--) {
+        if (!wins[i].used) continue;
+        if (x >= wins[i].x && x < wins[i].x + wins[i].w &&
+            y >= wins[i].y && y <= wins[i].y + 11)
+            return i;
+    }
+    return -1;
+}
+
+static void draw_cursor(void) {
+    int x = mouse_pos_x(), y = mouse_pos_y();
+    gfx_putpixel(x, y, 0x0F);
+    for (int i = 1; i <= 4; i++) {
+        if (x - i >= 0)      gfx_putpixel(x - i, y, 0x0F);
+        if (x + i < GFX_W)   gfx_putpixel(x + i, y, 0x0F);
+        if (y - i >= 0)      gfx_putpixel(x, y - i, 0x0F);
+        if (y + i < GFX_H)   gfx_putpixel(x, y + i, 0x0F);
+    }
+}
+
 void gui_enter(void) {
+    static int drag = -1, drag_ox = 0, drag_oy = 0;
+
     vga_set_mode13h();
     for (int i = 0; i < MAX_WIN; i++) wins[i].used = 0;
     focus = -1;
@@ -130,24 +155,56 @@ void gui_enter(void) {
     win_open(WIN_ABOUT);
 
     for (;;) {
+        /* --- mouse: click title bar -> focus + drag ------------------- */
+        if (mouse_left_clicked()) {
+            int w = win_at_title(mouse_pos_x(), mouse_pos_y());
+            if (w >= 0) {
+                if (focus >= 0) wins[focus].focused = 0;
+                focus = w;
+                wins[w].focused = 1;
+                drag = w;
+                drag_ox = mouse_pos_x() - wins[w].x;
+                drag_oy = mouse_pos_y() - wins[w].y;
+                redraw_all();
+            }
+        }
+        if (mouse_left_released()) {
+            drag = -1;
+        }
+        if (drag >= 0 && mouse_left_down()) {
+            int nx = mouse_pos_x() - drag_ox;
+            int ny = mouse_pos_y() - drag_oy;
+            if (nx < 0) nx = 0;
+            if (ny < 0) ny = 0;
+            if (nx + wins[drag].w > GFX_W) nx = GFX_W - wins[drag].w;
+            if (ny + wins[drag].h > GFX_H - 12) ny = GFX_H - 12 - wins[drag].h;
+            if (nx != wins[drag].x || ny != wins[drag].y) {
+                wins[drag].x = nx;
+                wins[drag].y = ny;
+                redraw_all();
+            }
+        }
+
+        /* --- keyboard ------------------------------------------------- */
         int c = keyboard_getc();
-        if (!c) continue;
-        if (c == 27) {                        /* Esc: close focused */
-            if (focus >= 0) win_close(focus);
-            continue;
+        if (c) {
+            if (c == 27) {                        /* Esc: close focused */
+                if (focus >= 0) win_close(focus);
+            } else switch (c) {
+            case 'c': case 'C': win_open(WIN_CONSOLE); break;
+            case 'a': case 'A': win_open(WIN_ABOUT); break;
+            case 'm': case 'M': win_open(WIN_MEMINFO); break;
+            case '\t': {                          /* cycle focus */
+                if (focus >= 0) wins[focus].focused = 0;
+                do { focus = (focus + 1) % MAX_WIN; } while (!wins[focus].used);
+                wins[focus].focused = 1;
+                redraw_all();
+                break;
+            }
+            default: break;
+            }
         }
-        switch (c) {
-        case 'c': case 'C': win_open(WIN_CONSOLE); break;
-        case 'a': case 'A': win_open(WIN_ABOUT); break;
-        case 'm': case 'M': win_open(WIN_MEMINFO); break;
-        case '\t': {                          /* cycle focus */
-            if (focus >= 0) wins[focus].focused = 0;
-            do { focus = (focus + 1) % MAX_WIN; } while (!wins[focus].used);
-            wins[focus].focused = 1;
-            redraw_all();
-            break;
-        }
-        default: break;
-        }
+
+        draw_cursor();
     }
 }
