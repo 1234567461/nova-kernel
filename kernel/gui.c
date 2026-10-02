@@ -117,10 +117,10 @@ static void win_draw_content(window_t *w) {
         u32 free_kb = mm_free_frames() * 4;
         gfx_drawstring(cx, cy,      "phys free:", 0x01, 0x07);
         ksprintf(buf, "%u KB", free_kb);
-        gfx_drawstring(cx + 72, cy, buf, 0x04, 0x07);
+        gfx_drawstring(cx + 88, cy, buf, 0x04, 0x07);
         gfx_drawstring(cx, cy + 12, "heap used:", 0x01, 0x07);
         ksprintf(buf, "%u B", kheap_used());
-        gfx_drawstring(cx + 72, cy + 12, buf, 0x04, 0x07);
+        gfx_drawstring(cx + 88, cy + 12, buf, 0x04, 0x07);
         break;
     }
 
