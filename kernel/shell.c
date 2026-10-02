@@ -136,6 +136,11 @@ static void cmd_help(void) {
         "  ls                list the FAT12 root directory\n"
         "  cat <file>        print a file from the data disk\n"
         "  hexdump <file>    dump a file as hex + ASCII\n"
+        "  stat <file>       size / first cluster / attribute\n"
+        "  write <f> <text>  create or replace a file with <text>\n"
+        "  append <f> <text> add <text> to the end of a file\n"
+        "  rm <file>         delete a file\n"
+        "  df                free space on the data disk\n"
         "  run <prog>        load a program from disk and run it in ring 3\n"
         "  echo <text>       print the arguments back\n"
         "  uptime            ticks since boot\n"
@@ -324,13 +329,102 @@ static void cmd_run(const char *name) {
     kfree(img);
 }
 
+static void cmd_stat(const char *name) {
+    u32 size = 0; u16 cluster = 0; u8 attr = 0;
+    char buf[96];
+    if (!fat_stat(name, &size, &cluster, &attr)) {
+        err("stat: no such file: ");
+        err(name);
+        con_write("\n", C_ERR);
+        return;
+    }
+    ksprintf(buf, "name    : %s\n", name);
+    puts(buf);
+    ksprintf(buf, "size    : %u bytes\n", size);
+    puts(buf);
+    ksprintf(buf, "cluster : %u\n", cluster);
+    puts(buf);
+    ksprintf(buf, "attr    : 0x%x%s\n", attr,
+             (attr & 0x10) ? " (directory)" : "");
+    puts(buf);
+}
+
+static void cmd_df(void) {
+    char buf[80];
+    if (!fat_mounted()) { err("df: no FAT disk mounted\n"); return; }
+    ksprintf(buf, "data disk: %u bytes free\n", fat_free_bytes());
+    puts(buf);
+}
+
+/* write/append: the text is everything after "file ".  Writing a file is
+ * what turns the filesystem from a reader into something the machine can
+ * actually keep state in. */
+static void cmd_write(char *args, int append_mode) {
+    /* args = "<name> <text...>" */
+    char *name = args;
+    while (*name == ' ') name++;
+    char *sp = name;
+    while (*sp && *sp != ' ') sp++;
+    if (!*sp) {
+        err(append_mode ? "append: usage: append <file> <text>\n"
+                        : "write: usage: write <file> <text>\n");
+        return;
+    }
+    *sp = '\0';
+    char *text = sp + 1;
+    while (*text == ' ') text++;
+    u32 tlen = 0; while (text[tlen]) tlen++;
+
+    static u8 buf[4096];
+    u32 size = 0;
+
+    if (append_mode) {
+        /* read the tail, then rewrite the file with the extra bytes */
+        if (fat_stat(name, &size, NULL, NULL)) {
+            if (size > 4096 - tlen) { err("append: file too large\n"); return; }
+            if (!fat_read(name, buf, 4096 - tlen, &size)) {
+                err("append: read failed\n");
+                return;
+            }
+        } else {
+            size = 0;
+        }
+    } else {
+        size = 0;
+    }
+    for (u32 i = 0; i < tlen; i++) buf[size + i] = (u8)text[i];
+    u32 total = size + tlen;
+
+    if (!fat_write(name, buf, total)) {
+        err("write: failed (disk full or directory full)\n");
+        return;
+    }
+    char msg[96];
+    ksprintf(msg, "%s: %s (%u bytes)\n",
+             append_mode ? "appended" : "wrote", name, total);
+    ok(msg);
+}
+
+static void cmd_rm(const char *name) {
+    if (!fat_delete(name)) {
+        err("rm: no such file: ");
+        err(name);
+        con_write("\n", C_ERR);
+        return;
+    }
+    ok("removed: ");
+    ok(name);
+    con_write("\n", C_OK);
+}
+
 /* ------------------------------------------------------------------ */
 /* tab completion                                                     */
 /* ------------------------------------------------------------------ */
 
 static const char *builtins[] = {
     "help", "clear", "meminfo", "tasks", "ps", "ls", "cat", "hexdump",
-    "run", "echo", "uptime", "gui", "about", "reboot", NULL
+    "run", "echo", "uptime", "gui", "about", "reboot",
+    "stat", "df", "write", "append", "rm", NULL
 };
 
 /* complete "cat rea<TAB>" -> "cat readme.txt" */
@@ -426,17 +520,52 @@ static void execute(char *cmdline) {
         if (argc < 2) err("hexdump: missing file operand\n");
         else          cmd_hexdump(argv[1]);
     }
+    else if (strcmp(c, "stat") == 0) {
+        if (argc < 2) err("stat: missing file operand\n");
+        else          cmd_stat(argv[1]);
+    }
+    else if (strcmp(c, "df") == 0) {
+        cmd_df();
+    }
+    else if (strcmp(c, "write") == 0 || strcmp(c, "append") == 0) {
+        if (argc < 3) {
+            err(strcmp(c, "write") == 0
+                ? "write: usage: write <file> <text>\n"
+                : "append: usage: append <file> <text>\n");
+        } else {
+            /* split() turned every separator into a NUL, so the original
+             * text is gone.  Re-join argv[1..] with single spaces: that
+             * keeps "write f a b" working and is what a shell would store
+             * for a quoted-free argument list anyway. */
+            static char tail[LINE_MAX];
+            u32 w = 0;
+            for (int i = 1; i < argc && w < LINE_MAX - 2; i++) {
+                if (i > 1 && w < LINE_MAX - 2) tail[w++] = ' ';
+                for (u32 k = 0; argv[i][k] && w < LINE_MAX - 2; k++)
+                    tail[w++] = argv[i][k];
+            }
+            tail[w] = '\0';
+            cmd_write(tail, strcmp(c, "append") == 0);
+        }
+    }
+    else if (strcmp(c, "rm") == 0) {
+        if (argc < 2) err("rm: missing file operand\n");
+        else          cmd_rm(argv[1]);
+    }
     else if (strcmp(c, "run")     == 0) {
         if (argc < 2) err("run: missing program name\n");
         else          cmd_run(argv[1]);
     }
     else if (strcmp(c, "echo")    == 0) {
-        /* re-join everything after the command word with single spaces */
-        char *p = cmdline;
-        while (*p == ' ') p++;
-        while (*p && *p != ' ') p++;
-        while (*p == ' ') p++;
-        cmd_echo(p);
+        static char tail[LINE_MAX];
+        u32 w = 0;
+        for (int i = 1; i < argc && w < LINE_MAX - 2; i++) {
+            if (i > 1 && w < LINE_MAX - 2) tail[w++] = ' ';
+            for (u32 k = 0; argv[i][k] && w < LINE_MAX - 2; k++)
+                tail[w++] = argv[i][k];
+        }
+        tail[w] = '\0';
+        cmd_echo(tail);
     }
     else {
         err("unknown command: ");

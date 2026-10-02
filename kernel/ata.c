@@ -36,3 +36,32 @@ int ata_read_sector(u32 lba, u8 *buf) {
         : : "D"(buf), "c"(256), "d"(ATA_SECONDARY) : "memory");
     return 1;
 }
+
+int ata_write_sector(u32 lba, const u8 *buf) {
+    if (!ata_present) return 0;
+    ata_poll_busy();
+    /* wait until the drive is ready to accept a command (DRDY, not busy) */
+    for (u32 i = 0; i < 2000000; i++) {
+        u8 st = inb(ATA_SECONDARY + 7);
+        if (!(st & 0x80) && (st & 0x40)) break;      /* !BSY && DRDY */
+    }
+
+    outb(ATA_SECONDARY + 6, (u8)(0xE0 | ((lba >> 24) & 0x0F)));
+    outb(ATA_SECONDARY + 2, 1);                      /* sector count */
+    outb(ATA_SECONDARY + 3, (u8)(lba & 0xFF));
+    outb(ATA_SECONDARY + 4, (u8)((lba >> 8) & 0xFF));
+    outb(ATA_SECONDARY + 5, (u8)((lba >> 16) & 0xFF));
+    outb(ATA_SECONDARY + 7, 0x30);                   /* WRITE SECTORS */
+
+    /* one sector = 256 words; the device wants them as fast as we can feed */
+    __asm__ volatile (
+        "cld\n\t"
+        "rep outsw\n\t"
+        : : "S"(buf), "c"(256), "d"(ATA_SECONDARY) : "memory");
+
+    /* flush the write cache, then confirm the command completed cleanly */
+    outb(ATA_SECONDARY + 7, 0xE7);                   /* FLUSH CACHE */
+    ata_poll_busy();
+    if (inb(ATA_SECONDARY + 7) & 0x01) return 0;     /* ERR */
+    return 1;
+}

@@ -12,5 +12,6 @@
 
 int  ata_init(void);                 /* probe; 1 = drive present */
 int  ata_read_sector(u32 lba, u8 *buf);   /* 1 on success */
+int  ata_write_sector(u32 lba, const u8 *buf);  /* 1 on success */
 
 #endif

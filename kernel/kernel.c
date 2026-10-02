@@ -120,14 +120,13 @@ void kernel_main(void) {
     sti();
 
     vga_init();
-    vga_write("\n", 0x0F);
-    vga_write("===============================================\n", 0x09);
-    vga_write("  NovaOS v1.0 - self-made operating system\n", 0x0F);
-    vga_write("  boot: stage1 -> stage2 -> pmode -> paging\n", 0x0F);
-    vga_write("  per-process page tables + COW fork\n", 0x0F);
-    vga_write("  type 'help', 'gui', 'ls', 'cat', 'run'\n", 0x0F);
-    vga_write("===============================================\n", 0x09);
-    vga_write("\n", 0x0F);
+    kprintf("\n===============================================\n");
+    kprintf("  NovaOS v1.0 - self-made operating system\n");
+    kprintf("  boot: stage1 -> stage2 -> pmode -> paging\n");
+    kprintf("  per-process page tables + COW fork\n");
+    kprintf("  type 'help', 'gui', 'ls', 'cat', 'run'\n");
+    kprintf("===============================================\n\n");
 
+    kprintf("shell: enter main loop (pid %u)\n", sched_current_pid());
     shell_run();
 }
