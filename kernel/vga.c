@@ -100,6 +100,34 @@ int vga_get_y(void) { return ty; }
 /* graphics mode                                                      */
 /* ------------------------------------------------------------------ */
 
+/* Standard 16-colour EGA/VGA palette, expanded to 6-bit DAC values.
+ * Without loading these the mode-13h DAC keeps whatever the previous mode
+ * left in it (all-black on a clean boot), so every colour index rendered
+ * as black and the desktop looked blank. */
+static const u8 vga_pal16[16][3] = {
+    {  0,  0,  0}, {  0,  0, 42}, {  0, 42,  0}, {  0, 42, 42},
+    { 42,  0,  0}, { 42,  0, 42}, { 42, 21,  0}, { 42, 42, 42},
+    { 21, 21, 21}, { 21, 21, 63}, { 21, 63, 21}, { 21, 63, 63},
+    { 63, 21, 21}, { 63, 21, 63}, { 63, 63, 21}, { 63, 63, 63}
+};
+
+static void vga_load_palette(void) {
+    outb(0x3C8, 0);                 /* start at DAC index 0 */
+    for (int i = 0; i < 16; i++) {
+        outb(0x3C9, vga_pal16[i][0]);
+        outb(0x3C9, vga_pal16[i][1]);
+        outb(0x3C9, vga_pal16[i][2]);
+    }
+    /* the remaining 240 entries reuse the same 16 colours so stray writes
+     * to high indices still show something sensible */
+    for (int i = 16; i < 256; i++) {
+        const u8 *c = vga_pal16[i & 15];
+        outb(0x3C9, c[0]);
+        outb(0x3C9, c[1]);
+        outb(0x3C9, c[2]);
+    }
+}
+
 void vga_set_mode13h(void) {
     /* standard VGA register sequence for 320x200x256 */
     outb(0x3C2, 0x63);
@@ -124,7 +152,8 @@ void vga_set_mode13h(void) {
     outb(0x3CE, 0x05); outb(0x3CF, 0x40);   /* graphics mode 0 */
     outb(0x3CE, 0x06); outb(0x3CF, 0x05);   /* odd/even off */
     outb(0x3CE, 0x07); outb(0x3CF, 0x0F);   /* color don't care */
-    outb(0x3C6, 0x14);                      /* misc */
+    outb(0x3C6, 0xFF);                      /* pixel-mask / DAC width */
+    vga_load_palette();                     /* <- was missing: black screen */
     gfx_clear(0x00);
 }
 
