@@ -9,6 +9,14 @@
  *   nr 6: sys_close(fd)
  *   nr 7: sys_sleep(ticks)         - yield the CPU for N timer ticks
  *   nr 8: sys_brk(addr)            - query/extend the heap break
+ *   nr 9: sys_lseek(fd, off, whence)  - reposition a file descriptor
+ *   nr 10: sys_unlink(name, len)   - delete a file
+ *   nr 11: sys_stat(name, len, &size) - size of a file
+ *   nr 12: sys_time()              - ticks since boot
+ *
+ * open() takes flags in edx: O_CREAT (2) creates, O_TRUNC (4) empties,
+ * O_WRONLY (1) makes the descriptor writable.  fd 0/1/2 are the console;
+ * the first file descriptor userland can receive is 3.
  *
  * SECURITY: every pointer that arrives from ring 3 is validated before it is
  * dereferenced.  The user window is the only region a ring-3 process may name
@@ -126,8 +134,14 @@ static u32 sys_write(u32 fd, const char *buf, u32 len) {
     return len;
 }
 
+/* File descriptors 0,1,2 are the console by convention, so the first file
+ * descriptor handed to userland is 3.  Returning index 0 here made a freshly
+ * created file alias stdout: write() found fd<3 and printed to the console
+ * instead of storing the data, and the file closed empty. */
+#define FD_FIRST_FILE 3
+
 static int alloc_fd(void) {
-    for (int i = 0; i < MAX_OPEN_FILES; i++)
+    for (int i = FD_FIRST_FILE; i < MAX_OPEN_FILES; i++)
         if (!ofiles[i].used) return i;
     return -1;
 }

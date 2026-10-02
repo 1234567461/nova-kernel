@@ -79,11 +79,20 @@ $(BUILD)/userspace/hello.elf: userspace/hello.c userspace/user.ld | $(BUILD)
 	      -Wl,-T,userspace/user.ld -Wl,--build-id=none -o $@ $<
 	@echo "hello.elf: user program ready"
 
+# writer.elf: second ring-3 program, exercises the file *write* syscalls
+$(BUILD)/userspace/writer.elf: userspace/writer.c userspace/user.ld | $(BUILD)
+	mkdir -p $(BUILD)/userspace
+	$(CC) -m32 -nostdlib -fno-pie -fno-stack-protector -fno-builtin \
+	      -mno-sse -mno-mmx -mno-80387 -static \
+	      -Wl,-T,userspace/user.ld -Wl,--build-id=none -o $@ $<
+	@echo "writer.elf: user program ready"
+
 # --- FAT12 data disk (attached as B: in QEMU) ---------------------------
 data: $(BUILD)/data.img
 
-$(BUILD)/data.img: $(BUILD)/userspace/hello.elf tools/mkdata.py | $(BUILD)
-	python3 tools/mkdata.py $(BUILD)/data.img $(BUILD)/userspace/hello.elf
+$(BUILD)/data.img: $(BUILD)/userspace/hello.elf $(BUILD)/userspace/writer.elf tools/mkdata.py | $(BUILD)
+	python3 tools/mkdata.py $(BUILD)/data.img $(BUILD)/userspace/hello.elf \
+	                         $(BUILD)/userspace/writer.elf
 
 # --- assemble the 1.44MB image --------------------------------------------
 image: $(BUILD)/boot.bin $(BUILD)/loader.bin $(BUILD)/kernel.bin

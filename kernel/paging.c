@@ -12,6 +12,7 @@
 #include "paging.h"
 #include "mm.h"
 #include "string.h"
+#include "serial.h"
 
 #define USER_PG_START 512              /* 0x200000 */
 #define USER_PG_END   768              /* 0x300000 */
@@ -19,6 +20,8 @@
 #define PTE_P   0x1
 #define PTE_W   0x2
 #define PTE_U   0x4
+
+static int smep_on = 0;
 
 void paging_init(void) {
     /* KERNEL_PD (0x9000) / KERNEL_PT (0xA000) are *already live*: the
@@ -53,7 +56,54 @@ void paging_init(void) {
     __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
     cr0 |= 0x80000000;                 /* PG */
     __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+
+    paging_harden_cpu();
 }
+
+/* Harden the MMU against the classic ring-3 attacks.
+ *
+ *  CR0.WP  - the kernel may no longer write through read-only PTEs.  Without
+ *            it a kernel store into a user page flagged read-only silently
+ *            succeeded, which defeats copy-on-write and would let a bug (or a
+ *            crafted syscall) modify a page it had just declared immutable.
+ *
+ *  CR4.SMEP - Supervisor Mode Execution Prevention.  The kernel faults if it
+ *            ever tries to *execute* a user page.  This closes the whole
+ *            family of "jump to a ring-3 buffer" attacks: a syscall that is
+ *            tricked into calling a function pointer it read from user
+ *            memory now dies instead of running attacker code at ring 0.
+ *
+ * Both features are probed through CPUID and skipped when absent, so the
+ * kernel still boots on an emulator or CPU that does not implement them. */
+void paging_harden_cpu(void) {
+    u32 cr0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 |= 0x00010000;                 /* WP */
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+
+    /* CPUID leaf 7, sub-leaf 0, EBX bit 7 = SMEP */
+    u32 max_leaf;
+    __asm__ volatile ("cpuid" : "=a"(max_leaf) : "a"(0) : "ebx", "ecx", "edx");
+    if (max_leaf >= 7) {
+        u32 a, b, c, d;
+        __asm__ volatile ("cpuid"
+                          : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                          : "a"(7), "c"(0));
+        if (b & (1u << 7)) {
+            u32 cr4;
+            __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+            cr4 |= (1u << 20);         /* SMEP */
+            __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+            smep_on = 1;
+        }
+    }
+    serial_puts("[sec] CR0.WP on");
+    if (smep_on) serial_puts(", CR4.SMEP on");
+    else         serial_puts(" (SMEP not available on this CPU)");
+    serial_puts("\n");
+}
+
+int paging_smep_enabled(void) { return smep_on; }
 
 void paging_switch(u32 cr3) {
     __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3));

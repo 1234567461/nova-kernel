@@ -20,4 +20,8 @@ int  paging_map_user_region(u32 cr3, u32 vaddr, u32 nbytes);
 /* page-fault hook: handles a COW write; returns 1 if resolved */
 int  paging_cow_fault(u32 cr2, u32 err);
 
+/* enable CR0.WP and CR4.SMEP where the CPU supports them */
+void paging_harden_cpu(void);
+int  paging_smep_enabled(void);
+
 #endif
