@@ -101,8 +101,16 @@ isr_common:
     # "code bytes" of whatever function happens to live at that address and
     # then call'd them as an entry point - the classic triple-fault loop.
     # "offset" forces the address itself to be used as an immediate.
+    #
+    # The handler takes struct regs * as its only argument: push the current
+    # ESP so the C side can walk the frame we just built.  Without this push
+    # the argument slot held the call's return address instead, so int_no and
+    # every other field read back as garbage - which is why IRQ0 looked like
+    # it never fired even though the gate and the stub were perfectly fine.
     mov eax, offset isr_common_handler
+    push esp
     call eax
+    add esp, 4
     pop gs
     pop fs
     pop es

@@ -14,6 +14,7 @@
 #include "string.h"
 #include "vga.h"
 #include "serial.h"
+#include "irq.h"
 
 static task_t tasks[MAX_TASKS];
 static u32    task_count = 0;
@@ -22,12 +23,46 @@ static u32    next_pid = 1;
 static int    sched_ready = 0;
 
 /* pointer to the struct regs of the interrupt currently being handled; it is
- * the save area used when a preemptive context switch happens. */
+ * the save area used when a preemptive context switch happens.
+ *
+ * NOTE: this must NOT be used to save the outgoing context.  The frame lives on
+ * the *interrupt* stack, which is re-entered by the very next IRQ (and by every
+ * other task), so a pointer to it goes stale the moment we switch away.  The
+ * outgoing stack pointer is taken from the running task's saved ESP instead
+ * (see sched_enter_irq), which is the only value that survives a switch.
+ */
 static struct regs *sched_current_frame = NULL;
 
+/* True once an IRQ frame has been observed: only from then on is the
+ * saved-ESP-in-task model consistent and preemption safe. */
 void sched_enter_irq(struct regs *r) {
+    /* First IRQ after boot: pin the adopted boot thread to the live frame so
+     * its ESP is a real interrupt stack address from the start. */
+    if (!sched_ready && task_count > 0 && tasks[current].esp == 0)
+        tasks[current].esp = (u32)r;
     sched_current_frame = r;
-    sched_ready = 1;               /* preemption is now safe */
+    sched_ready = 1;
+}
+
+/* Adopt the context that is executing right now (the kernel main thread) as a
+ * schedulable task.  Without this, `current` names tasks[0] while the CPU is
+ * actually running the boot thread, so the first switch saves/restores the
+ * wrong stack and no demo task ever makes progress. */
+u32 sched_adopt_current(const char *name) {
+    if (task_count >= MAX_TASKS) return 0;
+    task_t *t = &tasks[task_count];
+    t->pid = next_pid++;
+    t->state = 1;
+    t->flags = TASK_KERNEL;
+    t->stack_bottom = 0;
+    t->cr3 = 0;
+    t->slice_left = 5;
+    t->esp = 0;                      /* filled in by sched_enter_irq on 1st IRQ */
+    strncpy(t->name, name, sizeof(t->name) - 1);
+    t->name[sizeof(t->name) - 1] = '\0';
+    current = task_count;
+    task_count++;
+    return t->pid;
 }
 
 /* set up an initial stack frame so the task "returns" into fn() */
@@ -138,8 +173,14 @@ u32 task_fork_user(const char *name, u32 parent_esp, u32 parent_cr3) {
  * the same unwind sequence continues from there.
  */
 static void switch_to(struct regs *frame, u32 next) {
-    if (!sched_ready) { current = next; return; }
     u32 old = current;
+
+    /* A context switch never returns to isr_common_handler, so the PIC EOI
+     * that normally follows the handler call would be skipped.  An
+     * un-acknowledged IRQ0 stays latched in the 8259's ISR register and the
+     * PIC then blocks all further IRQ0 delivery - the first switch would be
+     * the last interrupt the system ever saw.  Acknowledge before leaving. */
+    pic_eoi(0);
 
     /* reload CR3 when entering a user task (or leaving one) */
     if (tasks[old].flags == TASK_USER || tasks[next].flags == TASK_USER) {
@@ -147,7 +188,15 @@ static void switch_to(struct regs *frame, u32 next) {
         paging_switch(cr3);
     }
 
-    tasks[old].esp = (u32)frame;       /* save the outgoing interrupt frame */
+    /* Save the *live* interrupt frame as the outgoing context.  `frame` is a
+     * pointer into the interrupt stack and is therefore the correct address to
+     * remember: when this task is resumed we reload ESP with it and unwind the
+     * exact same frame, continuing right where the IRQ interrupted us.
+     *
+     * The frame still lives on the kernel interrupt stack (the stub's pushad +
+     * iret frame), which is untouched while we run another task, so the address
+     * stays valid across the switch. */
+    tasks[old].esp = (u32)frame;
     current = next;
 
     __asm__ volatile (
@@ -169,11 +218,13 @@ void sched_yield(void) {
     if (!tasks[next].state) return;
     struct regs *frame = sched_current_frame;
     if (!frame) return;                /* only valid from interrupt context */
+    if (tasks[current].esp == 0) tasks[current].esp = (u32)frame;
     switch_to(frame, next);
 }
 
 void sched_tick(void) {
     if (task_count < 2) return;
+    if (!sched_ready) return;
     if (tasks[current].slice_left > 0) {
         tasks[current].slice_left--;
         return;
@@ -184,6 +235,7 @@ void sched_tick(void) {
         if (tasks[next].state) {
             struct regs *frame = sched_current_frame;
             if (!frame) return;
+            tasks[current].esp = (u32)frame;
             tasks[current].slice_left = 5;
             tasks[next].slice_left = 5;
             switch_to(frame, next);
@@ -207,6 +259,8 @@ u32 sched_task_count(void) {
  * ready task by unwinding its frame directly (never returns here). */
 void sched_exit_current(void) {
     tasks[current].state = 0;
+    /* never returns - acknowledge the interrupt we are leaving behind */
+    pic_eoi(0);
     /* release the exiting process's address space (COW refcounts drop,
      * private frames are freed) */
     if (tasks[current].flags == TASK_USER && tasks[current].cr3)

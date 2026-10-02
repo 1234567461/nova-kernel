@@ -25,6 +25,7 @@ typedef struct task {
 } task_t;
 
 void sched_init(void);
+u32  sched_adopt_current(const char *name);  /* make the running context task 0 */
 u32  task_create(const char *name, task_fn fn);
 u32  task_create_user(const char *name, u32 entry, u32 cr3);
 u32  task_fork_user(const char *name, u32 parent_esp, u32 parent_cr3);

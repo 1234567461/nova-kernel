@@ -20,14 +20,18 @@
 #include "string.h"
 #include "printf.h"
 
-/* demo kernel threads */
+/* demo kernel threads - each beats on the serial console a few times so
+ * round-robin scheduling is observable even with no display attached */
 static void demo_task_a(void) {
     u32 n = 0;
     for (;;) {
-        char buf[48];
-        ksprintf(buf, "[task A] pid %u heartbeat %u\n",
-                 sched_current_pid(), n++);
-        vga_write(buf, 0x0A);
+        if (n < 3) {
+            char buf[48];
+            int l = ksprintf(buf, "[task A] pid %u heartbeat %u\n",
+                             sched_current_pid(), n);
+            serial_write(buf, (u32)l);
+        }
+        n++;
         for (volatile u32 i = 0; i < 3000000; i++) ;
     }
 }
@@ -35,10 +39,13 @@ static void demo_task_a(void) {
 static void demo_task_b(void) {
     u32 n = 0;
     for (;;) {
-        char buf[48];
-        ksprintf(buf, "[task B] pid %u heartbeat %u\n",
-                 sched_current_pid(), n++);
-        vga_write(buf, 0x0E);
+        if (n < 3) {
+            char buf[48];
+            int l = ksprintf(buf, "[task B] pid %u heartbeat %u\n",
+                             sched_current_pid(), n);
+            serial_write(buf, (u32)l);
+        }
+        n++;
         for (volatile u32 i = 0; i < 3000000; i++) ;
     }
 }
@@ -104,6 +111,7 @@ void kernel_main(void) {
         kprintf("fat: mount failed\n");
 
     sched_init();
+    sched_adopt_current("main");        /* the boot thread becomes task 0 */
     task_create("demo-a", demo_task_a);
     task_create("demo-b", demo_task_b);
     try_load_user_app();
