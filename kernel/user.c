@@ -39,6 +39,25 @@ void user_init(void) {
     kprintf("user: TSS ready (ring0 stack 0x%x, ring3 supported)\n", tss.esp0);
 }
 
+/* Point the CPU's ring-3 -> ring-0 stack at this task's private kernel stack.
+ *
+ * A single shared esp0 is a correctness bug, not just a performance issue.
+ * Every interrupt - IRQ or int 0x80 - pushes its frame at esp0, so with one
+ * stack all tasks' saved interrupt frames land at the same address.  When the
+ * scheduler parks a preempted task it records that address; by the time the
+ * task is resumed the frame at that address belongs to whoever ran last, so
+ * the task continues from a stranger's context (it "restarts" at its fork
+ * point, or faults outright).  Giving each task its own kernel stack makes the
+ * saved frame address unique and stable.
+ *
+ * Called by the scheduler *before* it iret's into a task, and by the exit path
+ * for the task it is switching to. */
+void user_set_kernel_stack(u32 top) {
+    if (top) tss.esp0 = top;
+}
+
+u32 user_kernel_stack_top(void) { return tss.esp0; }
+
 /* ------------------------------------------------------------------ */
 /* Minimal ELF32 loader (ET_EXEC only, EM_386).  Loads PT_LOAD         */
 /* segments into the user window of the given address space and        */

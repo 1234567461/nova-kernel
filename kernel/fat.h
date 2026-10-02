@@ -12,6 +12,7 @@
 #define FAT_NAME_LEN  16
 
 int  fat_mount(void);                      /* 1 = ok */
+int  fat_mounted(void);                    /* 1 = a volume is mounted */
 int  fat_list(char names[][FAT_NAME_LEN], u32 sizes[], u32 max, u32 *count);
 int  fat_read(const char *name, u8 *out, u32 max, u32 *size);
 

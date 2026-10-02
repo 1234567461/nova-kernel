@@ -10,5 +10,6 @@ void serial_init(void);
 void serial_putc(char c);
 void serial_write(const char *s, u32 len);
 void serial_puts(const char *s);
+int  serial_getc(void);          /* next RX byte, or -1 if none pending */
 
 #endif

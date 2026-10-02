@@ -121,6 +121,19 @@ u32 paging_fork_addr_space(u32 parent_cr3) {
         }
     }
     ((u32*)pd)[0] = pt | 0x7;
+
+    /* CRITICAL: the parent's page table entries were just downgraded from
+     * writable to read-only, but its TLB still holds the old writable
+     * translations.  Without a flush the parent keeps writing the shared
+     * page directly - no COW fault ever fires - and it silently stomps the
+     * copy the child is about to run on.  That corruption is what made a
+     * freshly forked child resume at a stale return address and land in
+     * whatever code happened to live there.  Reload the parent's CR3 (when
+     * it is the address space currently loaded) to drop the stale entries. */
+    if (parent_cr3 == paging_get_cr3()) {
+        __asm__ volatile ("mov %%cr3, %%eax\n\t"
+                          "mov %%eax, %%cr3" : : : "eax", "memory");
+    }
     return pd;
 }
 
@@ -130,6 +143,18 @@ void paging_destroy_addr_space(u32 cr3) {
     for (int d = 0; d < 1024; d++) {
         if (!(pde[d] & PTE_P)) continue;
         u32 pt = pde[d] & 0xFFFFF000;
+
+        /* Only tear down page tables this process actually owns.
+         *
+         * paging_create_addr_space() copies KERNEL_PD wholesale, so every
+         * unused directory entry points straight at the shared kernel page
+         * table (KERNEL_PT) and - because the copy is per-entry, not
+         * per-address-space - a naive loop frees KERNEL_PT itself.  That
+         * unmaps the whole kernel and the machine dies a few instructions
+         * later.  A directory entry is ours only if it does not alias one of
+         * the kernel's own tables. */
+        if (pt == KERNEL_PT || pt == KERNEL_PD) continue;
+
         u32 *pte = (u32*)pt;
         for (u32 i = USER_PG_START; i < USER_PG_END; i++)
             if (pte[i] & PTE_P) mm_ref_dec(pte[i] >> 12);

@@ -1,15 +1,16 @@
-/* NovaOS - ring-3 userland demo program (v1.0: fork + COW demo).
+/* NovaOS - ring-3 userland program.
  *
  * Compiled as a static ELF32, linked at 0x200000 (USER_TEXT_BASE) and
  * entered at _start in ring 3.  It talks to the kernel only through the
  * int 0x80 ABI:
- *   0 = write(fd,buf,len)  1 = getpid()  2 = exit(code)  3 = fork()
+ *   0 = write(fd,buf,len)   1 = getpid()   2 = exit(code)   3 = fork()
+ *   4 = open(name,len)      5 = read(fd,buf,len)            6 = close(fd)
+ *   7 = sleep(ticks)        8 = brk(addr)
  *
- * fork() returns the child pid to the parent and 0 to the child.
- * Both sides then write to the same .data page - that write trips the
- * copy-on-write handler (#PF), which copies the frame so each process
- * gets an independent copy.  The kernel prints COW events via
- * "meminfo" style counters; here we just demonstrate the semantics.
+ * Two things are demonstrated:
+ *   1. file I/O - open/read/close pull a file off the FAT12 data disk
+ *   2. fork + copy-on-write - both sides write to the same .data page and
+ *      each ends up with an independent copy
  */
 typedef unsigned int u32;
 
@@ -27,14 +28,18 @@ static inline u32 syscall3(u32 nr, u32 a, u32 b, u32 c) {
 #define SYS_GETPID 1
 #define SYS_EXIT   2
 #define SYS_FORK   3
+#define SYS_OPEN   4
+#define SYS_READ   5
+#define SYS_CLOSE  6
+#define SYS_SLEEP  7
 
 /* lives in .data: the first write after fork() forces a COW copy */
 volatile u32 g_counter = 7;
 
+static u32 slen(const char *s) { u32 n = 0; while (s[n]) n++; return n; }
+
 static void putstr(const char *s) {
-    u32 n = 0;
-    while (s[n]) n++;
-    syscall3(SYS_WRITE, 1, (u32)s, n);
+    syscall3(SYS_WRITE, 1, (u32)s, slen(s));
 }
 
 static void putu32(u32 v) {
@@ -48,6 +53,31 @@ static void putu32(u32 v) {
     }
 }
 
+/* Read a file from the FAT data disk and echo it, exercising the new
+ * open/read/close syscalls. */
+static void cat_file(const char *name) {
+    u32 fd = syscall3(SYS_OPEN, (u32)name, slen(name), 0);
+    if (fd == (u32)-1) {
+        putstr("[ring3] open failed: ");
+        putstr(name);
+        putstr("\n");
+        return;
+    }
+    putstr("[ring3] --- ");
+    putstr(name);
+    putstr(" ---\n");
+
+    char buf[256];
+    for (;;) {
+        u32 n = syscall3(SYS_READ, fd, (u32)buf, sizeof(buf));
+        if (n == (u32)-1) { putstr("[ring3] read error\n"); break; }
+        if (n == 0) break;                       /* EOF */
+        syscall3(SYS_WRITE, 1, (u32)buf, n);
+    }
+    syscall3(SYS_CLOSE, fd, 0, 0);
+    putstr("\n[ring3] --- end ---\n");
+}
+
 void _start(void) {
     u32 me = syscall3(SYS_GETPID, 0, 0, 0);
 
@@ -55,6 +85,14 @@ void _start(void) {
     putu32(me);
     putstr(" hello from userland\n");
 
+    /* --- new: file I/O through the syscall ABI --- */
+    cat_file("readme.txt");
+
+    /* --- new: bounded cooperative sleep --- */
+    putstr("[ring3] sleeping 5 ticks...\n");
+    syscall3(SYS_SLEEP, 5, 0, 0);
+    putstr("[ring3] awake again\n");
+    /* --- original: fork + COW demo --- */
     putstr("[ring3] forking...\n");
     u32 child = syscall3(SYS_FORK, 0, 0, 0);
 
@@ -79,6 +117,13 @@ void _start(void) {
         putstr(" COW write ok, g_counter=");
         putu32(g_counter);
         putstr(" (independent copy)\n");
+        /* Yield several times so the child gets a slice of the CPU and both
+         * sides of the COW demo are actually observed.  Exiting immediately
+         * here used to tear the parent's address space down before the child
+         * ever ran, so only half the story was ever printed. */
+        putstr("[ring3-parent] yielding to let the child run...\n");
+        for (int i = 0; i < 30; i++)
+            syscall3(SYS_SLEEP, 3, 0, 0);
         putstr("[ring3-parent] exiting\n");
         syscall3(SYS_EXIT, 0, 0, 0);
     }

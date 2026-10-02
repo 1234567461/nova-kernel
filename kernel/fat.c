@@ -31,12 +31,28 @@ static u32  spc;                              /* sectors per cluster */
 static u8   secbuf[512];
 
 static u16 fat_next_cluster(u32 cluster) {
-    /* FAT12 entry: 12 bits at byte offset cluster + cluster/2 */
+    /* FAT12 entry: 12 bits at byte offset cluster + cluster/2.
+     *
+     * The two bytes can straddle a sector boundary, so read the sector that
+     * holds the first byte and - when the entry is split - also the one after
+     * it.  Reading only secbuf[off+1] used to return garbage for every entry
+     * that fell in the last byte of a sector, which silently truncated any
+     * file whose cluster chain touched that slot. */
     u32 offset = cluster + (cluster / 2);
     u32 lba = fat_lba + (offset / 512);
     u32 off = offset % 512;
     if (!ata_read_sector(lba, secbuf)) return 0x0FFF;
-    u16 v = (u16)(secbuf[off] | (secbuf[off + 1] << 8));
+
+    u16 lo, hi;
+    if (off == 511) {
+        lo = secbuf[511];
+        if (!ata_read_sector(lba + 1, secbuf)) return 0x0FFF;
+        hi = secbuf[0];
+    } else {
+        lo = secbuf[off];
+        hi = secbuf[off + 1];
+    }
+    u16 v = (u16)(lo | (hi << 8));
     if (cluster & 1) v >>= 4;
     else             v &= 0x0FFF;
     return v;
@@ -93,8 +109,9 @@ int fat_mount(void) {
     return 1;
 }
 
-int fat_list(char names[][FAT_NAME_LEN], u32 sizes[], u32 max, u32 *count) {
-    u32 n = 0;
+int fat_mounted(void) { return mounted; }
+
+int fat_list(char names[][FAT_NAME_LEN], u32 sizes[], u32 max, u32 *count) {    u32 n = 0;
     if (!mounted) return 0;
     for (u32 s = 0; s < root_sectors && n < max; s++) {
         if (!ata_read_sector(root_lba + s, secbuf)) break;
@@ -150,20 +167,28 @@ int fat_read(const char *name, u8 *out, u32 max, u32 *size) {
     }
     if (!found) return 0;
 
-    /* follow the cluster chain */
+    /* follow the cluster chain.
+     *
+     * A cluster is spc sectors, not one: walking the chain one sector at a
+     * time silently skipped (spc-1)/spc of every file as soon as the volume
+     * used anything but 1 sector per cluster.  Read the whole cluster and
+     * copy out only the bytes that are still missing. */
     u32 read = 0;
-    while (cluster >= 2 && read < fsize && read < max) {
-        u32 lba = data_lba + (cluster - 2) * spc;
-        u8  buf[512];
-        if (!ata_read_sector(lba, buf)) return 0;
-        u32 n = fsize - read;
-        if (n > 512) n = 512;
-        if (n > max - read) n = max - read;
-        memcpy(out + read, buf, n);
-        read += n;
+    u32 guard = 0;
+    while (cluster >= 2 && cluster < 0xFF0 && read < fsize && read < max) {
+        if (++guard > 65536) break;             /* corrupt chain: bail out */
+        u32 first = data_lba + (cluster - 2) * spc;
+        for (u32 s = 0; s < spc && read < fsize && read < max; s++) {
+            u8 buf[512];
+            if (!ata_read_sector(first + s, buf)) return 0;
+            u32 n = fsize - read;
+            if (n > 512) n = 512;
+            if (n > max - read) n = max - read;
+            memcpy(out + read, buf, n);
+            read += n;
+        }
         cluster = fat_next_cluster(cluster);
-        if (cluster >= 0xFF0) break;        /* EOC */
     }
-    *size = fsize;
+    *size = read < fsize ? read : fsize;
     return 1;
 }

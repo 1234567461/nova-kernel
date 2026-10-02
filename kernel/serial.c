@@ -28,3 +28,14 @@ void serial_write(const char *s, u32 len) {
 void serial_puts(const char *s) {
     while (*s) serial_putc(*s++);
 }
+
+/* Non-blocking receive.
+ *
+ * Returns the next byte from the UART RX FIFO, or -1 when nothing has
+ * arrived.  The shell polls this alongside the PS/2 keyboard so the machine
+ * can be driven from a serial console (QEMU -serial stdio/pipe/socket) with
+ * no display at all - which is also how it is tested in CI. */
+int serial_getc(void) {
+    if (!(inb(COM1 + 5) & 0x01)) return -1;      /* LSR bit0: data ready */
+    return (int)(u8)inb(COM1);
+}

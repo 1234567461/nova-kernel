@@ -15,6 +15,8 @@
 #define USER_STACK_TOP 0x2F0000u   /* user stack grows down from here */
 
 void user_init(void);                       /* install TSS + user GDT selectors */
+void user_set_kernel_stack(u32 top);        /* per-task ring0 stack (TSS.esp0) */
+u32  user_kernel_stack_top(void);
 u32  user_load_elf(u32 cr3, const u8 *img, u32 size); /* map + copy, returns entry */
 u32  user_spawn(const char *name, const u8 *img, u32 size); /* pid or 0 */
 

@@ -12,6 +12,7 @@ static u32 freq = 100;
 static void timer_handler(struct regs *r) {
     (void)r;
     ticks++;
+
     /* preemption: give the scheduler a chance to run on every tick.  Without
      * this the round-robin scheduler was never driven and only ever the direct
      * caller of kernel_main() ran - demo-a, demo-b and the ring-3 process
