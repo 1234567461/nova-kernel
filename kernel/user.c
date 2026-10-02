@@ -21,12 +21,19 @@ struct tss {
 
 static struct tss tss;
 
-extern u32 sys_stack_top;          /* defined in link.ld */
+/* sys_stack_top comes from link.ld as an *absolute symbol*, i.e. its value
+ * is already the address we want.  Declaring it as "extern u32" would make
+ * the compiler emit a load from that address instead of using the address
+ * itself, so esp0 ended up 0 - the CPU would then take the ring-3 -> ring-0
+ * transition with an invalid kernel stack and triple fault on the first IRQ.
+ * Declaring it as an array of unknown size and casting the array address is
+ * the standard idiom for linker-provided symbols. */
+extern char sys_stack_top[];
 
 void user_init(void) {
     memset(&tss, 0, sizeof(tss));
     tss.ss0  = GDT_DATA_SEL;
-    tss.esp0 = sys_stack_top;
+    tss.esp0 = (u32)sys_stack_top;
     gdt_set_tss((u32)&tss, (u32)sizeof(tss) - 1);
     __asm__ volatile ("ltr %0" : : "r"((u16)GDT_TSS_SEL));
     kprintf("user: TSS ready (ring0 stack 0x%x, ring3 supported)\n", tss.esp0);

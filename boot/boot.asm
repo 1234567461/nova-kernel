@@ -6,12 +6,18 @@
 #    1. Set up a flat 1.44MB "floppy" image loaded by the BIOS at 0x7C00
 #    2. Load stage2 (loader.bin) from sectors 2..3  -> 0x7E00
 #    3. Load kernel.bin  from sectors 4..N          -> 0x10000 (temporary)
-#    4. Jump to stage2
+#    4. Jump to stage2 directly (no far-jump syntax traps)
 #
 #  Layout of the raw image produced by the Makefile:
 #     sector 0          : this boot sector
 #     sectors 1-2       : loader.bin  (<= 1024 bytes)
 #     sectors 3..end    : kernel.bin
+#
+#  Disk access uses the classic INT 13h AH=02h CHS read, one sector per
+#  call.  A 1.44MB floppy has a fixed 18 sectors/track, 2 head geometry, so
+#  the CHS translation is exact.  AH=42h (extended LBA read) is deliberately
+#  NOT used: QEMU's floppy BIOS accepts it but the transfer silently stops
+#  short, which is far worse than an outright failure.
 # ============================================================================
 
     .code16
@@ -29,6 +35,7 @@
     .set LOADER_START_SECTOR, 2       # 1-based: loader begins at sector 2
     .set LOADER_SECTORS,   2          # loader fits in 2 sectors (1024B)
     .set KERNEL_START_SECTOR, 4       # kernel begins at sector 4
+    .set KERNEL_SECTORS,  200         # 200 * 512 = 102400 bytes max kernel
 
 _start:
     cli
@@ -46,86 +53,112 @@ _start:
     mov si, offset msg_boot
     call print_string
 
-    # --- load loader.bin: CHS read, sectors 2-3 -----------------------
+    # --- load loader.bin: LBA 1, 2 sectors -> 0x0000:0x7E00 -----------
     mov dl, [boot_drive]
-    mov si, LOADER_START_SECTOR
-    mov di, LOADER_SEG
-    mov ax, LOADER_OFF
+    mov ebx, LOADER_START_SECTOR - 1  # 0-based LBA
+    mov ax, LOADER_SEG
+    mov es, ax
+    mov di, LOADER_OFF
     mov cx, LOADER_SECTORS
     call read_sectors
 
-    # --- load kernel.bin: CHS read from sector 4 ----------------------
+    # --- load kernel.bin: LBA 3, up to 200 sectors -> 0x1000:0x0000 ---
     mov dl, [boot_drive]
-    mov si, KERNEL_START_SECTOR
-    mov di, KERNEL_SEG
-    mov ax, KERNEL_OFF
-    mov cx, 200                     # 200 sectors * 512 = 102400 bytes max kernel
+    mov ebx, KERNEL_START_SECTOR - 1
+    mov ax, KERNEL_SEG
+    mov es, ax
+    mov di, KERNEL_OFF
+    mov cx, KERNEL_SECTORS
     call read_sectors
 
     mov si, offset msg_ok
     call print_string
 
     # --- jump to stage2 ------------------------------------------------
-    jmp LOADER_SEG:LOADER_OFF
+    # "jmp $SEG:$OFF" would assemble SEG as an intra-segment offset; use
+    # an explicit far return instead, which is unambiguous.
+    push word ptr LOADER_SEG        # target CS
+    push word ptr LOADER_OFF        # target IP
+    retf
 
     # ===================================================================
-    #  read_sectors(dl=drive, si=LBA(1-based), di=seg, ax=offset, cx=count)
-    #  Converts LBA to CHS:  sector = (LBA % 18)+1, head=(LBA/18)%2,
-    #                        cyl = LBA / (18*2)
+    #  read_sectors - read cx sectors starting at 0-based LBA ebx into
+    #  ES:DI, advancing DI across 64KB boundaries as needed.
+    #    in : dl = drive, ebx = LBA, es:di = buffer, cx = sector count
+    #    out: CF clear on success, carry set + message on failure
+    #
+    #  Primary path is the classic INT 13h AH=02h CHS read: a 1.44MB
+    #  floppy has a fixed 18 sectors/track, 2 heads geometry, and this
+    #  call works on every BIOS including QEMU's.  (AH=42h LBA reads are
+    #  nominally nicer, but not all BIOS implementations provide them for
+    #  floppy drives, so they are only used as a fallback below.)
+    # ===================================================================
+    # in : dl = drive, ebx = 0-based LBA, es:di = buffer, cx = sector count
+    # out: CF clear on success, carry set + message on failure
+    #
+    # Everything the loop needs lives in memory, because INT 13h AH=02h
+    # requires DL, CX, DX and BX to be repurposed for the CHS argument and
+    # the transfer buffer; keeping any of it in a register guarantees the
+    # next iteration computes a bogus CHS from clobbered state.
     # ===================================================================
 read_sectors:
     pusha
-    mov [dap_count], cx
-    xor bx, bx                      # bx = LBA (0-based)
-    mov bx, si
-    dec bx                          # convert to 0-based
-.loop:
-    mov dx, 0
-    mov ax, bx
+    mov [sect_left], cx
+    mov [buf_off], di
+    mov [buf_seg], es
+    mov [cur_lba], bx               # only the low 16 bits matter (< 2880)
+    mov [cur_drive], dl
+
+.rs_loop:
+    # --- LBA([cur_lba]) -> CHS -----------------------------------------
+    #   sector = (LBA % 18) + 1, head = (LBA / 18) % 2, cyl = LBA / 36
+    #
+    # Careful: the sector number is parked in BL while the second division
+    # runs, because "mov cx, HEADS" would otherwise overwrite CL - and CL
+    # is exactly where the sector number has to end up.  Stashing it in CX
+    # first and reloading CX for the divisor silently truncated every LBA
+    # to the "sector" of an 18-sector period, so every read past the first
+    # physical track fetched the wrong sector.
+    mov ax, [cur_lba]               # LBA is < 2^16 for a 1.44MB floppy
+    xor dx, dx
     mov cx, SECT_PER_TRACK
-    div cx                          # ax = head/cyl part, dx = sector(0-based)
-    mov [chs_sector], dl
-    inc byte ptr [chs_sector]       # sectors are 1-based
-    mov dx, 0
+    div cx                          # ax = LBA/18, dx = LBA%18
+    mov bl, dl
+    inc bl                          # BL = sector (1-based)
+    xor dx, dx
     mov cx, HEADS
-    div cx                          # ax = cyl, dx = head
-    mov [chs_head], dl
-    mov [chs_cyl], al
+    div cx                          # ax = cylinder, dx = head
+    mov ch, al                      # cyl (low 8 bits are enough here)
+    mov dh, dl                      # head
+    mov cl, bl                      # sector (1-based)
 
-    mov ax, di
+    mov dl, [cur_drive]
+    mov ax, [buf_seg]
     mov es, ax
-    mov bx, [save_offset]
-    mov ah, 0x02                    # BIOS: read sectors
-    mov al, 1
-    mov ch, [chs_cyl]
-    mov cl, [chs_sector]
-    mov dh, [chs_head]
-    mov dl, [boot_drive]
+    mov bx, [buf_off]
+    mov ax, 0x0201                 # AH=02 read, AL=1 sector
     int 0x13
-    jc .disk_error
+    jc .rs_error
 
-    # advance offset by 512 bytes
-    add word ptr [save_offset], 512
-    jnc .no_seg_advance
-    mov ax, es
-    add ax, 0x1000                  # carry across 64KB boundary
-    mov es, ax
-    mov di, ax
-.no_seg_advance:
-    inc bx
-    dec word ptr [dap_count]
-    jnz .loop
+    # --- advance buffer by one sector, wrapping the segment ------------
+    add word ptr [buf_off], 512
+    jnc .rs_nowrap
+    add word ptr [buf_seg], 0x1000
+.rs_nowrap:
+    inc word ptr [cur_lba]
+    dec word ptr [sect_left]
+    jnz .rs_loop
+
     popa
+    clc
     ret
 
-.disk_error:
+.rs_error:
     mov si, offset msg_disk_err
     call print_string
-    jmp .halt
-.halt:
-    cli
-    hlt
-    jmp .halt
+    popa
+    stc
+    ret
 
     # ===================================================================
     #  print_string(si) - BIOS teletype output
@@ -147,11 +180,11 @@ print_string:
     # -------------------------------------------------------------------
     # (single .text section so objcopy -O binary produces one flat blob)
 boot_drive:    .byte 0x00
-chs_sector:    .byte 0x00
-chs_head:      .byte 0x00
-chs_cyl:       .byte 0x00
-dap_count:     .word 0x0000
-save_offset:   .word 0x0000
+cur_drive:     .byte 0x00
+sect_left:     .word 0x0000
+buf_off:       .word 0x0000
+buf_seg:       .word 0x0000
+cur_lba:       .word 0x0000
 
 msg_boot:      .asciz "NovaOS boot v0.1\n"
 msg_ok:        .asciz "kernel loaded\n"

@@ -32,7 +32,12 @@ _start:
     out 0x92, al
 
     # --- load GDT ------------------------------------------------------
-    lgdt [gdt_desc]
+    # Must use the 16-bit form explicitly: "lgdt [gdt_desc]" in .code16
+    # makes GNU as emit a 32-bit operand form (66-prefixed) while the
+    # R_386_16 relocation only patches 2 address bytes, so the instruction
+    # ends up 3 bytes short and the following bytes decode as garbage.
+    # lgdtw is the correct 16-bit-base descriptor-pointer load here.
+    lgdtw [gdt_desc]
 
     # --- switch to protected mode --------------------------------------
     mov eax, cr0

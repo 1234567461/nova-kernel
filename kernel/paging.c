@@ -21,10 +21,23 @@
 #define PTE_U   0x4
 
 void paging_init(void) {
-    memset((void*)KERNEL_PD, 0, 0x1000);
-    memset((void*)KERNEL_PT, 0, 0x1000);
-
+    /* KERNEL_PD (0x9000) / KERNEL_PT (0xA000) are *already live*: the
+     * stage-2 bootloader built exactly this identity map and set CR3 to it
+     * before jumping here.  So we must NOT memset either structure - zeroing
+     * the active page directory (or page table) unmaps the code currently
+     * executing and the stack it is using, which faults on the very next
+     * instruction fetch and escalates #PF -> #DF -> triple fault.
+     *
+     * Instead we rewrite the page-table entries in place.  Every entry below
+     * the user window is written with the same identity mapping the loader
+     * installed, so the running code (0x100000+) and the kernel stack
+     * (0x10F000) keep their translations throughout.  Only the user window
+     * entries (0x200000-0x2FFFFF, pages 512..767), which are unused until a
+     * process is created, are cleared.
+     */
     u32 *pt = (u32*)KERNEL_PT;
+    u32 *pd = (u32*)KERNEL_PD;
+
     for (u32 i = 0; i < 1024; i++) {
         if (i >= USER_PG_START && i < USER_PG_END)
             pt[i] = 0;                 /* user window: per-process */
@@ -32,7 +45,7 @@ void paging_init(void) {
             pt[i] = (i * 0x1000) | 0x3;
     }
 
-    u32 *pd = (u32*)KERNEL_PD;
+    /* keep PDE[0] pointing at the kernel page table (present + rw + user) */
     pd[0] = KERNEL_PT | 0x7;
 
     paging_switch(KERNEL_PD);

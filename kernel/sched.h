@@ -3,6 +3,7 @@
 #define NOVA_SCHED_H
 
 #include "common.h"
+#include "idt.h"
 
 #define MAX_TASKS    16
 #define TASK_STACK   0x4000         /* 16KB per kernel-task stack */
@@ -27,6 +28,7 @@ void sched_init(void);
 u32  task_create(const char *name, task_fn fn);
 u32  task_create_user(const char *name, u32 entry, u32 cr3);
 u32  task_fork_user(const char *name, u32 parent_esp, u32 parent_cr3);
+void sched_enter_irq(struct regs *r);   /* stub tells us the live irq frame */
 void sched_yield(void);             /* cooperative yield */
 void sched_tick(void);              /* called by timer IRQ */
 void sched_exit_current(void);      /* never returns - switches away */

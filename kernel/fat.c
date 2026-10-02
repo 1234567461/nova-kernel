@@ -42,24 +42,31 @@ static u16 fat_next_cluster(u32 cluster) {
     return v;
 }
 
-/* normalize "name" to the FAT 8.3 uppercase form ("hello.elf" -> "HELLO ELF") */
+/* normalize "name" to the FAT 8.3 uppercase form ("hello.elf" -> "HELLO   ELF").
+ *
+ * The directory entry is always 11 bytes wide and space (0x20) padded, so
+ * the comparison buffer must be space padded too.  Zero padding never
+ * matches anything on a real FAT volume - that was why "hello.elf" was
+ * reported as missing even on a correctly mounted disk.
+ */
 static void norm_name(const char *in, char out[12]) {
-    char base[9] = {0}, ext[4] = {0};
+    char base[8], ext[3];
+    for (int k = 0; k < 8; k++) base[k] = ' ';
+    for (int k = 0; k < 3; k++) ext[k]  = ' ';
+
     u32 i = 0;
-    while (in[i] && in[i] != '.' && i < 8) {
-        base[i] = (char)((in[i] >= 'a' && in[i] <= 'z') ? in[i] - 32 : in[i]);
-        i++;
-    }
+    for (u32 k = 0; in[i] && in[i] != '.' && k < 8; k++, i++)
+        base[k] = (char)((in[i] >= 'a' && in[i] <= 'z') ? in[i] - 32 : in[i]);
+
     if (in[i] == '.') {
         i++;
-        u32 j = 0;
-        while (in[i] && j < 3) {
-            ext[j] = (char)((in[i] >= 'a' && in[i] <= 'z') ? in[i] - 32 : in[i]);
-            i++; j++;
-        }
+        for (u32 k = 0; in[i] && k < 3; k++, i++)
+            ext[k] = (char)((in[i] >= 'a' && in[i] <= 'z') ? in[i] - 32 : in[i]);
     }
-    for (i = 0; i < 8; i++) out[i] = base[i];
-    for (i = 0; i < 3; i++) out[8 + i] = ext[i];
+
+    for (u32 k = 0; k < 8; k++) out[k]     = base[k];
+    for (u32 k = 0; k < 3; k++) out[8 + k] = ext[k];
+    out[11] = '\0';
 }
 
 static int dir_match(const u8 *dir, const char norm[12]) {

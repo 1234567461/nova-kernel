@@ -21,7 +21,7 @@ LDFLAGS := -m elf_i386 -T link.ld -nostdlib
 # kernel.bin may not exceed 200 sectors (102400 bytes) - matches boot.asm
 KERNEL_MAX := 102400
 
-C_SRCS := kernel/gdt.c kernel/idt.c kernel/isr.c kernel/irq.c \
+C_SRCS := kernel/entry.c kernel/gdt.c kernel/idt.c kernel/isr.c kernel/irq.c \
           kernel/timer.c kernel/keyboard.c kernel/mouse.c kernel/vga.c \
           kernel/serial.c kernel/mm.c kernel/kheap.c kernel/paging.c \
           kernel/sched.c kernel/syscall.c kernel/user.c kernel/ata.c \
@@ -36,15 +36,23 @@ K_OBJS := $(C_OBJS) $(ASM_OBJS)
 all: image data
 
 # --- boot sector + stage2 -----------------------------------------------
+# Both blobs contain "offset symbol" references that GNU as leaves as
+# R_386_16 relocations.  objcopy -O binary does NOT resolve them, so the
+# linker has to - otherwise every data label reference is off by a few
+# bytes and the boot sector reads garbage / jumps nowhere.
 $(BUILD)/boot.bin: boot/boot.asm | $(BUILD)
 	$(AS) --32 $< -o $(BUILD)/boot.o
-	$(OBJCOPY) -O binary $(BUILD)/boot.o $@
+	$(LD) -m elf_i386 -Ttext 0x7C00 --oformat binary -o $@ $(BUILD)/boot.o
 	@test $$(stat -c%s $@) -eq 512 || (echo "ERROR: boot.bin != 512 bytes"; exit 1)
 	@echo "boot.bin: $$(stat -c%s $@) bytes (sector 0)"
 
 $(BUILD)/loader.bin: boot/loader.asm | $(BUILD)
 	$(AS) --32 $< -o $(BUILD)/loader.o
-	$(OBJCOPY) -O binary $(BUILD)/loader.o $@
+	# The loader runs at 0x7E00, so every absolute reference inside it
+	# (notably lgdt [gdt_desc]) must be relocated to that address.
+	# Without this, lgdt reads from physical 0x00B8 and the CPU triple
+	# faults the moment it tries to load CS with the bogus GDT.
+	$(LD) -m elf_i386 -Ttext 0x7E00 --oformat binary -o $@ $(BUILD)/loader.o
 	@test $$(stat -c%s $@) -le 1024 || (echo "ERROR: loader.bin > 1024 bytes"; exit 1)
 	@echo "loader.bin: $$(stat -c%s $@) bytes (sectors 1-2)"
 
@@ -93,7 +101,9 @@ check: image data
 	@ls -lh $(BUILD)/data.img
 
 run: image data
-	qemu-system-i386 -fda $(BUILD)/novaos.img -fdb $(BUILD)/data.img -serial stdio
+	qemu-system-i386 -fda $(BUILD)/novaos.img \
+	    -drive file=$(BUILD)/data.img,format=raw,if=ide,index=2 \
+	    -boot a -serial stdio
 
 clean:
 	rm -rf $(BUILD)

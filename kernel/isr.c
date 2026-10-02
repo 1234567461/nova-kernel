@@ -49,6 +49,10 @@ void isr_common_handler(struct regs *r) {
         for (;;) hlt();
     } else if (r->int_no >= 32 && r->int_no <= 47) {
         u8 irq = (u8)(r->int_no - 32);
+        /* hand the scheduler a pointer to this live interrupt frame so a
+         * preemptive switch can save/restore it correctly */
+        extern void sched_enter_irq(struct regs *r);
+        sched_enter_irq(r);
         if (irq_handlers[irq])
             irq_handlers[irq](r);
         pic_eoi(irq);

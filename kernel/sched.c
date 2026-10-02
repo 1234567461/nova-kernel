@@ -21,6 +21,15 @@ static u32    current = 0;
 static u32    next_pid = 1;
 static int    sched_ready = 0;
 
+/* pointer to the struct regs of the interrupt currently being handled; it is
+ * the save area used when a preemptive context switch happens. */
+static struct regs *sched_current_frame = NULL;
+
+void sched_enter_irq(struct regs *r) {
+    sched_current_frame = r;
+    sched_ready = 1;               /* preemption is now safe */
+}
+
 /* set up an initial stack frame so the task "returns" into fn() */
 static void task_setup_stack(task_t *t, task_fn fn) {
     u32 *sp = (u32*)(t->stack_bottom + TASK_STACK);
@@ -116,26 +125,51 @@ u32 task_fork_user(const char *name, u32 parent_esp, u32 parent_cr3) {
     return t->pid;
 }
 
-static void switch_to(u32 next) {
+/* Switch to task `next` from inside an interrupt handler.
+ *
+ * This is *not* a normal function call: after loading the new task's ESP we
+ * must unwind the interrupt frame ourselves (pop gs/fs/es/ds, popad, drop
+ * int_no/err_code, iret) instead of returning with `ret`.  A plain `ret`
+ * would pop the first dword of the new task's frame - its interrupt number -
+ * and jump there, which is exactly the triple-fault this used to cause.
+ *
+ * `frame` points at the struct regs the stub built for the *outgoing* task,
+ * so that value is what we store as its saved ESP; when it is resumed later
+ * the same unwind sequence continues from there.
+ */
+static void switch_to(struct regs *frame, u32 next) {
     if (!sched_ready) { current = next; return; }
     u32 old = current;
+
     /* reload CR3 when entering a user task (or leaving one) */
     if (tasks[old].flags == TASK_USER || tasks[next].flags == TASK_USER) {
         u32 cr3 = (tasks[next].flags == TASK_USER) ? tasks[next].cr3 : KERNEL_PD;
         paging_switch(cr3);
     }
-    __asm__ volatile (
-        "mov %%esp, %0\n\t"
-        "mov %1, %%esp\n\t"
-        : "=m"(tasks[old].esp) : "r"(tasks[next].esp) : "memory");
+
+    tasks[old].esp = (u32)frame;       /* save the outgoing interrupt frame */
     current = next;
+
+    __asm__ volatile (
+        "mov %0, %%esp\n\t"
+        "pop %%gs\n\t"
+        "pop %%fs\n\t"
+        "pop %%es\n\t"
+        "pop %%ds\n\t"
+        "popal\n\t"
+        "add $8, %%esp\n\t"
+        "iret\n\t"
+        : : "r"(tasks[next].esp) : "memory");
+    for (;;) hlt();                    /* not reached */
 }
 
 void sched_yield(void) {
     if (task_count < 2) return;
     u32 next = (current + 1) % task_count;
-    if (!tasks[next].state) { return; }   /* keep it simple */
-    switch_to(next);
+    if (!tasks[next].state) return;
+    struct regs *frame = sched_current_frame;
+    if (!frame) return;                /* only valid from interrupt context */
+    switch_to(frame, next);
 }
 
 void sched_tick(void) {
@@ -148,9 +182,11 @@ void sched_tick(void) {
     for (u32 i = 1; i <= task_count; i++) {
         u32 next = (current + i) % task_count;
         if (tasks[next].state) {
+            struct regs *frame = sched_current_frame;
+            if (!frame) return;
             tasks[current].slice_left = 5;
             tasks[next].slice_left = 5;
-            switch_to(next);
+            switch_to(frame, next);
             return;
         }
     }

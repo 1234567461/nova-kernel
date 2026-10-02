@@ -58,7 +58,7 @@ static void try_load_user_app(void) {
         else
             kprintf("user: hello.elf load failed (bad image?)\n");
     } else {
-        kprintf("user: hello.elf not found (attach data.img with -fdb)\n");
+        kprintf("user: hello.elf not found (attach data.img as IDE secondary master)\n");
     }
     kfree(appbuf);
 }

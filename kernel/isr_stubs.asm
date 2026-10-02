@@ -8,6 +8,9 @@
     .intel_syntax noprefix
     .section .text
 
+    /* isr_common_handler() is defined in isr.c */
+    .extern isr_common_handler
+
     .macro ISR_NOERR n
     .globl isr\n
 isr\n:
@@ -92,7 +95,13 @@ isr_common:
     mov fs, ax
     mov gs, ax
     # stack now: gs fs es ds edi esi ebp esp ebx edx ecx eax int_no err
-    mov eax, isr_common_handler
+    #
+    # NB: "mov eax, isr_common_handler" without the offset keyword makes GNU
+    # as emit a memory load (mov eax, ds:<addr>), which fetched the first four
+    # "code bytes" of whatever function happens to live at that address and
+    # then call'd them as an entry point - the classic triple-fault loop.
+    # "offset" forces the address itself to be used as an immediate.
+    mov eax, offset isr_common_handler
     call eax
     pop gs
     pop fs
