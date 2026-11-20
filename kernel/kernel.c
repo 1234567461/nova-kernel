@@ -68,7 +68,7 @@ static void try_load_user_app(void) {
         else
             kprintf("user: hello.elf load failed (bad image?)\n");
     } else {
-        kprintf("user: hello.elf not found (attach data.img as IDE secondary master)\n");
+        kprintf("user: hello.elf not found (attach data.img as an IDE disk)\n");
     }
     kfree(appbuf);
 }
@@ -117,7 +117,7 @@ void kernel_main(void) {
     else
         bootlog_ok("CR0.WP (SMEP n/a)");
 
-    bootlog_start("ata", "secondary master");
+    bootlog_start("ata", "probe");
     if (ata_init())
         bootlog_ok(NULL);
     else

@@ -93,11 +93,19 @@ static int dir_match(const u8 *dir, const char norm[12]) {
 
 int fat_mount(void) {
     mounted = 0;
-    if (!ata_init()) return 0;
-    if (!ata_read_sector(0, secbuf)) return 0;
+    if (!ata_init()) { kprintf("fat: no ATA device\n"); return 0; }
+    if (!ata_read_sector(0, secbuf)) {
+        kprintf("fat: sector 0 read failed\n");
+        return 0;
+    }
+    kprintf("fat: boot %02x %02x %02x %02x | bps=%u spc=%u rsv=%u fats=%u root=%u\n",
+            secbuf[0], secbuf[1], secbuf[2], secbuf[3],
+            (u32)(secbuf[11] | (secbuf[12] << 8)),
+            (u32)secbuf[13], (u32)(secbuf[14] | (secbuf[15] << 8)),
+            (u32)secbuf[16], (u32)(secbuf[17] | (secbuf[18] << 8)));
 
     struct fat_bpb *b = (struct fat_bpb*)secbuf;
-    if (b->bytes_per_sector != 512) return 0;
+    if (b->bytes_per_sector != 512) { kprintf("fat: bad bytes/sector\n"); return 0; }
 
     fat_lba      = b->reserved_sectors;
     fat_sectors  = b->fat_size16;
