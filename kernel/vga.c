@@ -264,9 +264,16 @@ void gfx_putpixel(int x, int y, u8 color) {
 }
 
 void gfx_fillrect(int x0, int y0, int x1, int y1, u8 color) {
-    for (int y = y0; y <= y1 && y < GFX_H; y++)
-        for (int x = x0; x <= x1 && x < GFX_W; x++)
-            VGA_FB[y * GFX_W + x] = color;
+    /* clip once, then memset each row: the old per-pixel loop re-did the
+     * bounds test 64000 times per repaint and dominated the drag latency */
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= GFX_W) x1 = GFX_W - 1;
+    if (y1 >= GFX_H) y1 = GFX_H - 1;
+    if (x0 > x1 || y0 > y1) return;
+    u32 w = (u32)(x1 - x0 + 1);
+    for (int y = y0; y <= y1; y++)
+        memset((void*)(VGA_FB + y * GFX_W + x0), color, w);
 }
 
 void gfx_drawchar(int x, int y, char c, u8 fg, u8 bg) {

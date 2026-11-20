@@ -93,6 +93,9 @@ static u32 sys_write_file(u32 fd, const char *buf, u32 len) {
     struct open_file *f = &ofiles[fd];
     if (!f->used || !f->writable) return (u32)-1;
     if (!user_range_ok((u32)buf, len)) return (u32)-1;
+    /* belt-and-braces: pos is normally clamped by lseek, but a write past
+     * the buffer would be an out-of-bounds store, not just a wrong answer */
+    if (f->pos > OFILE_CAP) return (u32)-1;
 
     u32 room = OFILE_CAP - f->pos;
     if (len > room) len = room;
@@ -104,6 +107,8 @@ static u32 sys_write_file(u32 fd, const char *buf, u32 len) {
 }
 
 /* flush a modified file back to the FAT volume */
+static u32 sys_sync(u32 fd);      /* files_flush_all comes from syscall.h */
+
 static u32 sys_sync(u32 fd) {
     if (fd >= MAX_OPEN_FILES) return (u32)-1;
     struct open_file *f = &ofiles[fd];
@@ -150,6 +155,14 @@ static u32 sys_open(const char *name, u32 len, u32 flags) {
     if (!user_range_ok((u32)name, len)) return (u32)-1;
     if (len == 0 || len > sizeof(ofiles[0].name) - 1) return (u32)-1;
 
+    /* Coherence: the FAT only sees a new/modified file at close() time, so
+     * re-opening a file this process just wrote - still dirty, directory
+     * entry not yet on disk - used to fail with ENOENT even though the
+     * name was "there".  Flush everything dirty first so the disk state
+     * matches what userland can observe.  Only dirty files are written,
+     * so the common open path stays cheap. */
+    files_flush_all();
+
     char local[32];
     for (u32 i = 0; i < len; i++) local[i] = name[i];
     local[len] = '\0';
@@ -181,6 +194,13 @@ static u32 sys_read(u32 fd, char *buf, u32 len) {
     if (!f->used) return (u32)-1;
     if (!user_range_ok((u32)buf, len)) return (u32)-1;
 
+    /* SECURITY: f->pos can sit past EOF after an lseek(2) beyond the end.
+     * "f->size - f->pos" on unsigned ints then wraps to a huge value, the
+     * len clamp below never fires, and the copy loop walks f->data far past
+     * its 2048-byte allocation - leaking the neighbouring open_file structs
+     * (and whatever else lives in .bss) into ring 3.  Treat pos >= size as
+     * EOF instead. */
+    if (f->pos >= f->size) return 0;
     u32 avail = f->size - f->pos;
     if (len > avail) len = avail;
     for (u32 i = 0; i < len; i++) buf[i] = (char)f->data[f->pos + i];
@@ -196,6 +216,16 @@ static u32 sys_close(u32 fd) {
     ofiles[fd].writable = 0;
     ofiles[fd].dirty    = 0;
     return rc == (u32)-1 ? (u32)-1 : 0;
+}
+
+/* Write back every dirty open file.  Called when a task exits: there is no
+ * per-task fd table yet, so a process that forgot to close() (or died) used
+ * to take its data with it - the dirty flag sat in the global table forever
+ * and the FAT never saw the bytes. */
+void files_flush_all(void) {
+    for (u32 fd = FD_FIRST_FILE; fd < MAX_OPEN_FILES; fd++)
+        if (ofiles[fd].used && ofiles[fd].dirty)
+            sys_sync(fd);
 }
 
 void syscall_dispatch(struct regs *r) {

@@ -38,13 +38,18 @@
 #include "kheap.h"
 #include "io.h"
 
+/* scheduler / paging live data shown in the Tasks and System Info windows */
+extern u32 sched_task_count(void);
+extern u32 sched_current_pid(void);
+extern int  paging_smep_enabled(void);
+
 #define MAX_WIN   8
 #define TASKBAR_H 12
 #define TITLE_H   12
 #define CASCADE_X 10
 #define CASCADE_Y 14
 
-enum { WIN_CONSOLE, WIN_ABOUT, WIN_MEMINFO, WIN_TASKS, WIN_FILES };
+enum { WIN_CONSOLE, WIN_ABOUT, WIN_MEMINFO, WIN_TASKS, WIN_FILES, WIN_SYSINFO };
 
 typedef struct {
     int  used;
@@ -72,6 +77,7 @@ static const char *win_title(int type) {
     case WIN_MEMINFO: return "Memory Info";
     case WIN_TASKS:   return "Tasks";
     case WIN_FILES:   return "Files";
+    case WIN_SYSINFO: return "System Info";
     }
     return "Window";
 }
@@ -125,8 +131,6 @@ static void win_draw_content(window_t *w) {
     }
 
     case WIN_TASKS: {
-        extern u32 sched_task_count(void);
-        extern u32 sched_current_pid(void);
         u32 n = sched_task_count();
         ksprintf(buf, "%u task(s)", n);
         gfx_drawstring(cx, cy, buf, 0x01, 0x07);
@@ -151,12 +155,26 @@ static void win_draw_content(window_t *w) {
         break;
     }
 
+    case WIN_SYSINFO: {
+        ksprintf(buf, "up %u.%02u s", (u32)(timer_ticks() / 100),
+                 (u32)(timer_ticks() % 100));
+        gfx_drawstring(cx, cy, buf, 0x01, 0x07);
+        gfx_drawstring(cx, cy + 12, "CR0.WP  on", 0x02, 0x07);
+        if (paging_smep_enabled())
+            gfx_drawstring(cx, cy + 22, "SMEP    on", 0x02, 0x07);
+        else
+            gfx_drawstring(cx, cy + 22, "SMEP    n/a", 0x0E, 0x07);
+        ksprintf(buf, "%u tasks", sched_task_count());
+        gfx_drawstring(cx, cy + 36, buf, 0x01, 0x07);
+        break;
+    }
+
     case WIN_CONSOLE:
     default:
         gfx_drawstring(cx, cy,      "kernel: hello from C",  0x02, 0x07);
         gfx_drawstring(cx, cy + 12, "boot: loader->pmode",   0x02, 0x07);
         gfx_drawstring(cx, cy + 24, "user: ring3 process",   0x02, 0x07);
-        gfx_drawstring(cx, cy + 38, "press C A M T F",       0x0E, 0x07);
+        gfx_drawstring(cx, cy + 38, "press C A M T F Y",     0x0E, 0x07);
         break;
     }
 }
@@ -285,8 +303,9 @@ void gui_enter(void) {
     win_open(WIN_CONSOLE);
     win_open(WIN_ABOUT);
     win_open(WIN_MEMINFO);
+    win_open(WIN_SYSINFO);
 
-    serial_puts("[gui] mode 13h desktop up (320x200x256), windows=3\n");
+    serial_puts("[gui] mode 13h desktop up (320x200x256), windows=4\n");
 
     for (;;) {
         /* ---- snapshot the consuming edge-detectors exactly once ---- */
@@ -303,6 +322,19 @@ void gui_enter(void) {
                 win_close(c);
                 need_redraw = 1;
                 drag = -1;
+            } else if (in.my >= GFX_H - TASKBAR_H) {
+                /* taskbar buttons: focus the matching window.  The buttons
+                 * used to be pure decoration - clicking them did nothing. */
+                int bx = 60;
+                for (int i = 0; i < MAX_WIN && bx <= GFX_W - 50; i++) {
+                    if (!wins[i].used) continue;
+                    if (in.mx >= bx - 2 && in.mx <= bx + 42) {
+                        win_raise(i);
+                        need_redraw = 1;
+                        break;
+                    }
+                    bx += 46;
+                }
             } else {
                 int w = win_at_title(in.mx, in.my);
                 if (w >= 0) {
@@ -348,6 +380,7 @@ void gui_enter(void) {
             case 'm': case 'M': win_open(WIN_MEMINFO); need_redraw = 1; break;
             case 't': case 'T': win_open(WIN_TASKS);   need_redraw = 1; break;
             case 'f': case 'F': win_open(WIN_FILES);   need_redraw = 1; break;
+            case 'y': case 'Y': win_open(WIN_SYSINFO); need_redraw = 1; break;
             case '\t': {                                     /* cycle focus */
                 int open = 0;
                 for (int i = 0; i < MAX_WIN; i++) if (wins[i].used) open++;

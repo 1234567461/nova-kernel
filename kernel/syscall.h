@@ -6,5 +6,6 @@
 #include "idt.h"
 
 void syscall_dispatch(struct regs *r);
+void files_flush_all(void);      /* write back all dirty open files */
 
 #endif

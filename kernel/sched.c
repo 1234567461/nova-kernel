@@ -395,6 +395,11 @@ void sched_exit_current(void) {
         tasks[me].pid, task_count);
       serial_write(d, (u32)l); }
 
+    /* A task that exits with files still open must not take its data to the
+     * grave: there is no per-task fd table, so flush the global dirty files
+     * here.  Tasks that did close() properly just see a no-op. */
+    files_flush_all();
+
     /* pick the next runnable task (never ourselves) and jump into it */
     for (u32 i = 1; i < task_count; i++) {
         u32 next = (me + i) % task_count;
