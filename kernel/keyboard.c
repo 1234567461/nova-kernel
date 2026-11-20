@@ -71,6 +71,9 @@ static void keyboard_handler(struct regs *r) {
         case 0x53:                                   /* delete     */
             kb_enqueue_u16((u16)(KEY_EXT + sc));
             break;
+        case 0x4E:                                   /* keypad plus */
+            kb_enqueue((u8)'+');
+            break;
         default:
             break;
         }
@@ -81,6 +84,16 @@ static void keyboard_handler(struct regs *r) {
     else if (sc == 0xAA || sc == 0xB6) shift = 0;    /* shift up */
     else if (sc == 0x3A) caps = !caps;
     else if (sc & 0x80) { /* key release: ignore */ }
+    else if (sc >= 0x47 && sc <= 0x53) {
+        /* non-extended codes in the keypad block are the NumLock-on
+         * digits and arithmetic (QEMU's sendkey kp_* emits exactly
+         * these).  The cursor meanings of 0x48/0x4B/0x4D/0x50 arrive
+         * with the 0xE0 prefix and are handled above. */
+        static const char kp_map[13] = {
+            '7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.'
+        };
+        kb_enqueue((u8)kp_map[sc - 0x47]);
+    }
     else {
         const char *map = shift ? sc_shift : sc_plain;
         char c = map[sc & 0x7F];

@@ -37,6 +37,7 @@
 #include "mm.h"
 #include "kheap.h"
 #include "io.h"
+#include "fat.h"
 
 /* scheduler / paging live data shown in the Tasks and System Info windows */
 extern u32 sched_task_count(void);
@@ -49,7 +50,8 @@ extern int  paging_smep_enabled(void);
 #define CASCADE_X 10
 #define CASCADE_Y 14
 
-enum { WIN_CONSOLE, WIN_ABOUT, WIN_MEMINFO, WIN_TASKS, WIN_FILES, WIN_SYSINFO };
+enum { WIN_CONSOLE, WIN_ABOUT, WIN_MEMINFO, WIN_TASKS, WIN_FILES,
+       WIN_SYSINFO, WIN_NOTEPAD, WIN_CALC, WIN_BROWSER };
 
 typedef struct {
     int  used;
@@ -63,6 +65,74 @@ static window_t wins[MAX_WIN];
 static int focus = -1;
 static int cascade = 0;
 
+/* ---- application state, one instance per app type --------------------- */
+
+#define NP_CAP   512                 /* notepad text buffer */
+static char np_buf[NP_CAP];
+static u32  np_len = 0;
+
+#define CALC_CAP 32
+static char calc_buf[CALC_CAP];      /* expression being typed */
+static u32  calc_len = 0;
+static int  calc_has_result = 0;
+static int  calc_result = 0;
+static char calc_err[20];
+
+#define BR_PAGE_HOME 0
+static int  br_page = BR_PAGE_HOME;  /* 0 home, 1..3 = FAT documents */
+
+#define FILE_ROWS 6
+static char   fl_names[FILE_ROWS][FAT_NAME_LEN];
+static u32    fl_sizes[FILE_ROWS];
+static u32    fl_count = 0;
+static int    fl_valid = 0;          /* refreshed since last open */
+
+static void files_refresh(void) {
+    u32 n = 0;
+    if (fat_mounted() && fat_list(fl_names, fl_sizes, FILE_ROWS, &n))
+        fl_count = n;
+    else
+        fl_count = 0;
+    fl_valid = 1;
+}
+
+/* evaluate the calc expression strictly left-to-right (no precedence):
+ * returns 1 on success, 0 on division by zero, -1 on a malformed expr */
+static int calc_eval(const char *s, int *out) {
+    int acc = 0, num = 0, have_num = 0;
+    char op = '+';
+    for (; *s; s++) {
+        if (*s >= '0' && *s <= '9') {
+            num = num * 10 + (*s - '0');
+            have_num = 1;
+        } else if (*s == '+' || *s == '-' || *s == '*' || *s == '/') {
+            if (!have_num) return -1;
+            if (op == '+') acc += num;
+            else if (op == '-') acc -= num;
+            else if (op == '*') acc *= num;
+            else {
+                if (num == 0) return 0;
+                acc /= num;
+            }
+            op = *s;
+            num = 0;
+            have_num = 0;
+        } else {
+            return -1;                 /* anything else is garbage */
+        }
+    }
+    if (!have_num) return -1;
+    if (op == '+') acc += num;
+    else if (op == '-') acc -= num;
+    else if (op == '*') acc *= num;
+    else {
+        if (num == 0) return 0;
+        acc /= num;
+    }
+    *out = acc;
+    return 1;
+}
+
 /* one-frame snapshot of the input edges, so the consuming edge-detectors
  * are each called exactly once per iteration */
 typedef struct {
@@ -72,14 +142,30 @@ typedef struct {
 
 static const char *win_title(int type) {
     switch (type) {
-    case WIN_CONSOLE: return "Console";
-    case WIN_ABOUT:   return "About NovaOS";
-    case WIN_MEMINFO: return "Memory Info";
-    case WIN_TASKS:   return "Tasks";
-    case WIN_FILES:   return "Files";
-    case WIN_SYSINFO: return "System Info";
+    case WIN_CONSOLE:  return "Console";
+    case WIN_ABOUT:    return "About NovaOS";
+    case WIN_MEMINFO:  return "Memory Info";
+    case WIN_TASKS:    return "Tasks";
+    case WIN_FILES:    return "Files";
+    case WIN_SYSINFO:  return "System Info";
+    case WIN_NOTEPAD:  return "Notepad";
+    case WIN_CALC:     return "Calculator";
+    case WIN_BROWSER:  return "NovaBrowse";
     }
     return "Window";
+}
+
+/* draw up to maxlines lines of text, wrapping at maxchars columns;
+ * returns the y of the next free row */
+static int draw_wrapped(const char *s, int x, int y, int maxchars,
+                        int maxlines, u8 fg) {
+    for (int line = 0; line < maxlines && *s; line++) {
+        int col = 0;
+        while (*s && col < maxchars && *s != '\n')
+            gfx_drawchar(x + col * 8, y + line * 9, *s++, fg, 0x07), col++;
+        if (*s == '\n') s++;
+    }
+    return y + maxlines * 9;
 }
 
 static void win_draw_frame(window_t *w) {
@@ -123,8 +209,8 @@ static void win_draw_content(window_t *w) {
         gfx_drawstring(cx, cy + 11, "home-grown kernel",   0x01, 0x07);
         gfx_drawstring(cx, cy + 21, "GDT IDT paging",      0x01, 0x07);
         gfx_drawstring(cx, cy + 31, "ring3 FAT12 mouse",   0x01, 0x07);
-        gfx_drawstring(cx, cy + 45, "drag: title bar",     0x0E, 0x07);
-        gfx_drawstring(cx, cy + 55, "close: x or Esc",     0x0E, 0x07);
+        gfx_drawstring(cx, cy + 45, "N notepad K calc B browse",     0x0E, 0x07);
+        gfx_drawstring(cx, cy + 55, "drag: title, close: x/Esc",     0x0E, 0x07);
         break;
 
     case WIN_MEMINFO: {
@@ -152,14 +238,89 @@ static void win_draw_content(window_t *w) {
     case WIN_FILES: {
         extern int fat_mounted(void);
         extern u32 fat_free_bytes(void);
-        gfx_drawstring(cx, cy, "FAT12 volume", 0x01, 0x07);
-        if (fat_mounted()) {
-            ksprintf(buf, "free %u KB", fat_free_bytes() / 1024);
-            gfx_drawstring(cx, cy + 12, buf, 0x02, 0x07);
-        } else {
-            gfx_drawstring(cx, cy + 12, "no volume", 0x0C, 0x07);
+        if (!fat_mounted()) {
+            gfx_drawstring(cx, cy, "no FAT12 volume", 0x0C, 0x07);
+            break;
         }
-        gfx_drawstring(cx, cy + 26, "try: ls / cat", 0x0E, 0x07);
+        if (fl_count == 0) {
+            gfx_drawstring(cx, cy, "volume empty", 0x0E, 0x07);
+        } else {
+            for (u32 i = 0; i < fl_count && i < FILE_ROWS; i++) {
+                ksprintf(buf, "%-12s %6u B", fl_names[i], fl_sizes[i]);
+                gfx_drawstring(cx, cy + (int)i * 9, buf, 0x02, 0x07);
+            }
+        }
+        ksprintf(buf, "free %u KB", fat_free_bytes() / 1024);
+        gfx_drawstring(cx, cy + FILE_ROWS * 9 + 4, buf, 0x01, 0x07);
+        break;
+    }
+
+    case WIN_NOTEPAD: {
+        int maxc = (w->w - 14) / 8;
+        int maxl = (w->h - TITLE_H - 18) / 9;
+        draw_wrapped(np_buf, cx, cy, maxc, maxl, 0x01);
+        /* caret: a solid block right after the last character */
+        gfx_drawstring(cx, cy + maxl * 9,
+                       "type here - saved on close", 0x0E, 0x07);
+        break;
+    }
+
+    case WIN_CALC: {
+        gfx_fillrect(w->x + 5, cy, w->x + w->w - 6, cy + 11, 0x0F);
+        u32 elen = calc_len > 18 ? calc_len - 18 : 0;
+        gfx_drawstring(cx, cy + 2, calc_buf + elen, 0x01, 0x0F);
+        if (calc_has_result) {
+            ksprintf(buf, "= %d", calc_result);
+            gfx_drawstring(cx, cy + 16, buf, 0x02, 0x07);
+        } else if (calc_err[0]) {
+            gfx_drawstring(cx, cy + 16, calc_err, 0x0C, 0x07);
+        }
+        gfx_drawstring(cx, cy + 30, "0-9 + - * / =  C clear", 0x0E, 0x07);
+        gfx_drawstring(cx, cy + 40, "left-to-right, no precedence", 0x06, 0x07);
+        break;
+    }
+
+    case WIN_BROWSER: {
+        int maxc = (w->w - 14) / 8;
+        int maxl = (w->h - TITLE_H - 16) / 9;
+        static const char *links[3] =
+            { "1. readme.txt", "2. hello.txt", "3. about" };
+        if (br_page == BR_PAGE_HOME) {
+            gfx_drawstring(cx, cy, "NovaBrowse 0.1", 0x09, 0x07);
+            gfx_drawstring(cx, cy + 11, "the NovaOS web", 0x06, 0x07);
+            for (int i = 0; i < 3; i++)
+                gfx_drawstring(cx, cy + 26 + i * 9, links[i], 0x04, 0x07);
+            gfx_drawstring(cx, cy + 26 + 3 * 9,
+                           "press 1-3 to follow a link", 0x0E, 0x07);
+        } else {
+            const char *addr = (br_page == 3) ? "doc://about"
+                                              : (br_page == 1)
+                                                ? "doc://readme.txt"
+                                                : "doc://hello.txt";
+            gfx_fillrect(w->x + 5, cy, w->x + w->w - 6, cy + 10, 0x08);
+            gfx_drawstring(cx, cy + 1, addr, 0x0F, 0x08);
+            char doc[640];
+            u32 size = 0;
+            if (br_page != 3 && fat_mounted() &&
+                fat_read(br_page == 1 ? "readme.txt" : "hello.txt",
+                         (u8*)doc, sizeof(doc) - 1, &size) && size) {
+                doc[size] = '\0';
+            } else if (br_page == 3) {
+                strncpy(doc,
+                        "NovaBrowse renders text documents from the FAT12 "
+                        "volume. No network stack yet - the real web is a "
+                        "future project.", sizeof(doc) - 1);
+                doc[sizeof(doc) - 1] = '\0';
+            } else {
+                strncpy(doc, "(document not found)", sizeof(doc) - 1);
+                doc[sizeof(doc) - 1] = '\0';
+            }
+            draw_wrapped(doc, cx, cy + 12, maxc, maxl, 0x01);
+        }
+        gfx_drawstring(cx, cy + (w->h - TITLE_H - 13),
+                       br_page == BR_PAGE_HOME ? "H home | 1-3 links"
+                                               : "H home | 1-3 links",
+                       0x0E, 0x07);
         break;
     }
 
@@ -182,7 +343,7 @@ static void win_draw_content(window_t *w) {
         gfx_drawstring(cx, cy,      "kernel: hello from C",  0x02, 0x07);
         gfx_drawstring(cx, cy + 12, "boot: loader->pmode",   0x02, 0x07);
         gfx_drawstring(cx, cy + 24, "user: ring3 process",   0x02, 0x07);
-        gfx_drawstring(cx, cy + 38, "press C A M T F Y",     0x0E, 0x07);
+        gfx_drawstring(cx, cy + 38, "C A M T F Y N K B",     0x0E, 0x07);
         break;
     }
 }
@@ -277,18 +438,42 @@ static int win_open(int type) {
         w->x = CASCADE_X + (cascade % 6) * 16;
         w->y = CASCADE_Y + (cascade % 6) * 14;
         cascade++;
-        w->w = 168;
-        w->h = 88;
+        /* per-app default geometry: the desktop is only 320x200 */
+        switch (type) {
+        case WIN_NOTEPAD: w->w = 212; w->h = 112; break;
+        case WIN_BROWSER: w->w = 224; w->h = 118; break;
+        case WIN_CALC:    w->w = 172; w->h = 86;  break;
+        default:          w->w = 168; w->h = 88;  break;
+        }
+        if (w->x + w->w > GFX_W) w->x = GFX_W - w->w;
+        if (w->y + w->h > GFX_H - TASKBAR_H)
+            w->y = GFX_H - TASKBAR_H - w->h;
         strncpy(w->title, win_title(type), sizeof(w->title) - 1);
         w->title[sizeof(w->title) - 1] = '\0';
+        if (type == WIN_FILES) files_refresh();
+        if (type == WIN_NOTEPAD) {          /* resume the last session */
+            u32 size = 0;
+            if (fat_mounted() &&
+                fat_read("notepad.txt", (u8*)np_buf, NP_CAP - 1, &size)) {
+                np_buf[size] = '\0';
+                np_len = size;
+            }
+        }
         win_raise(i);
         return i;
     }
     return -1;                 /* out of window slots */
 }
 
+/* persist the notepad contents; called when its window closes */
+static void notepad_save(void) {
+    if (!fat_mounted() || np_len == 0) return;
+    fat_write("notepad.txt", (const u8*)np_buf, np_len);
+}
+
 static void win_close(int idx) {
     if (idx < 0 || idx >= MAX_WIN || !wins[idx].used) return;
+    if (wins[idx].type == WIN_NOTEPAD) notepad_save();
     wins[idx].used = 0;
     focus = -1;
     for (int i = MAX_WIN - 1; i >= 0; i--)
@@ -317,9 +502,9 @@ void gui_enter(void) {
     cascade = 0;
 
     win_open(WIN_CONSOLE);
-    win_open(WIN_ABOUT);
-    win_open(WIN_MEMINFO);
-    win_open(WIN_SYSINFO);
+    win_open(WIN_BROWSER);
+    win_open(WIN_FILES);
+    win_open(WIN_NOTEPAD);
 
     serial_puts("[gui] mode 13h desktop up (320x200x256), windows=4\n");
 
@@ -382,21 +567,91 @@ void gui_enter(void) {
             }
         }
 
-        /* ---- keyboard ---- */
+        /* ---- keyboard ----
+         * Editable apps (notepad / calculator / browser) swallow normal
+         * keys while focused; global hotkeys apply only when no editable
+         * window has focus.  Esc always closes, Enter still leaves the
+         * desktop unless an editable window needs the key. */
         int c = keyboard_getc();
+        int editing = (focus >= 0 &&
+                       (wins[focus].type == WIN_NOTEPAD ||
+                        wins[focus].type == WIN_CALC ||
+                        wins[focus].type == WIN_BROWSER));
         if (c) {
             if (c == 27) {                                   /* Esc */
                 if (focus >= 0) win_close(focus);
                 need_redraw = 1;
+            } else if (editing && c != '\t') {
+                switch (wins[focus].type) {
+                case WIN_NOTEPAD:
+                    if (c == '\b' || c == 127) {             /* backspace */
+                        if (np_len) np_buf[--np_len] = '\0';
+                    } else if (c == '\n' || c == '\r') {
+                        if (np_len < NP_CAP - 2) {
+                            np_buf[np_len++] = '\n';
+                            np_buf[np_len] = '\0';
+                        }
+                    } else if (c >= 32 && c < 127 &&
+                               np_len < NP_CAP - 1) {
+                        np_buf[np_len++] = (char)c;
+                        np_buf[np_len] = '\0';
+                    }
+                    break;
+                case WIN_CALC:
+                    if (c == '\b' || c == 127) {
+                        if (calc_len) calc_buf[--calc_len] = '\0';
+                        calc_has_result = 0;
+                        calc_err[0] = '\0';
+                    } else if (c == '=' || c == '\r' || c == '\n') {
+                        int r;
+                        int rc = calc_eval(calc_buf, &r);
+                        if (rc == 1) {
+                            calc_result = r;
+                            calc_has_result = 1;
+                            calc_err[0] = '\0';
+                        } else {
+                            calc_has_result = 0;
+                            strncpy(calc_err, rc == 0 ? "div by zero"
+                                      : "syntax error",
+                                      sizeof(calc_err) - 1);
+                            calc_err[sizeof(calc_err) - 1] = '\0';
+                        }
+                    } else if (c == 'c' || c == 'C') {
+                        calc_len = 0;
+                        calc_buf[0] = '\0';
+                        calc_has_result = 0;
+                        calc_err[0] = '\0';
+                    } else if ((c >= '0' && c <= '9') ||
+                               c == '+' || c == '-' || c == '*' ||
+                               c == '/') {
+                        if (calc_len < CALC_CAP - 1) {
+                            calc_buf[calc_len++] = (char)c;
+                            calc_buf[calc_len] = '\0';
+                        }
+                        calc_has_result = 0;
+                        calc_err[0] = '\0';
+                    }
+                    break;
+                case WIN_BROWSER:
+                    if (c >= '1' && c <= '3')
+                        br_page = c - '0';
+                    else if (c == 'h' || c == 'H')
+                        br_page = BR_PAGE_HOME;
+                    break;
+                }
+                need_redraw = 1;
             } else if (c == 0x0D || c == 0x0A) {             /* Enter: leave GUI */
                 break;
             } else switch (c) {
-            case 'c': case 'C': win_open(WIN_CONSOLE); need_redraw = 1; break;
-            case 'a': case 'A': win_open(WIN_ABOUT);   need_redraw = 1; break;
-            case 'm': case 'M': win_open(WIN_MEMINFO); need_redraw = 1; break;
-            case 't': case 'T': win_open(WIN_TASKS);   need_redraw = 1; break;
-            case 'f': case 'F': win_open(WIN_FILES);   need_redraw = 1; break;
-            case 'y': case 'Y': win_open(WIN_SYSINFO); need_redraw = 1; break;
+            case 'c': case 'C': win_open(WIN_CONSOLE);  need_redraw = 1; break;
+            case 'a': case 'A': win_open(WIN_ABOUT);    need_redraw = 1; break;
+            case 'm': case 'M': win_open(WIN_MEMINFO);  need_redraw = 1; break;
+            case 't': case 'T': win_open(WIN_TASKS);    need_redraw = 1; break;
+            case 'f': case 'F': win_open(WIN_FILES);    need_redraw = 1; break;
+            case 'y': case 'Y': win_open(WIN_SYSINFO);  need_redraw = 1; break;
+            case 'n': case 'N': win_open(WIN_NOTEPAD);  need_redraw = 1; break;
+            case 'k': case 'K': win_open(WIN_CALC);     need_redraw = 1; break;
+            case 'b': case 'B': win_open(WIN_BROWSER);  need_redraw = 1; break;
             case '\t': {                                     /* cycle focus */
                 int open = 0;
                 for (int i = 0; i < MAX_WIN; i++) if (wins[i].used) open++;
