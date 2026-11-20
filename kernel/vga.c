@@ -174,31 +174,61 @@ int vga_get_y(void) { return ty; }
 /* graphics mode                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Standard 16-colour EGA/VGA palette, expanded to 6-bit DAC values.
- * Without loading these the mode-13h DAC keeps whatever the previous mode
- * left in it (all-black on a clean boot), so every colour index rendered
- * as black and the desktop looked blank. */
+/* Custom 16-colour palette (6-bit DAC values) in the classic EGA index
+ * order, retuned for a modern dark-desktop look: charcoal window frames,
+ * a deep blue desktop gradient and bright accent colours.  Only the DAC
+ * values differ from stock EGA - every code in the kernel keeps its
+ * semantic meaning (0x07 light content, 0x09 focused title bar, 0x0C
+ * close box, ...). */
 static const u8 vga_pal16[16][3] = {
-    {  0,  0,  0}, {  0,  0, 42}, {  0, 42,  0}, {  0, 42, 42},
-    { 42,  0,  0}, { 42,  0, 42}, { 42, 21,  0}, { 42, 42, 42},
-    { 21, 21, 21}, { 21, 21, 63}, { 21, 63, 21}, { 21, 63, 63},
-    { 63, 21, 21}, { 63, 21, 63}, { 63, 63, 21}, { 63, 63, 63}
+    {  8, 10, 12},        /* 00 black  -> charcoal (shadows, taskbar)  */
+    { 30, 36, 46},        /* 01 blue   -> desktop gradient top         */
+    { 62, 74, 96},        /* 02 green  -> desktop gradient bottom      */
+    { 20, 24, 30},        /* 03 cyan   -> window body (dark)           */
+    {208, 52, 60},        /* 04 red    -> about title, errors          */
+    { 86, 98,116},        /* 05 magenta-> window body (light)          */
+    {128,138,152},        /* 06 brown  -> secondary text               */
+    {202,208,216},        /* 07 grey   -> normal text                  */
+    { 56, 62, 74},        /* 08 d.grey -> unfocused title bar          */
+    { 46,110,210},        /* 09 d.blue -> focused title bar            */
+    { 70,190, 90},        /* 10 green  -> ok / values                  */
+    { 60,140,230},        /* 11 cyan   -> bright accent                */
+    {230, 60, 50},        /* 12 red    -> close box                    */
+    {245,180, 40},        /* 13 yellow -> hints                        */
+    {120,190,250},        /* 14 yellow -> hints (light blue)           */
+    {245,247,250}         /* 15 white  -> titles, borders              */
 };
 
+/* Desktop gradient: the 240 palette slots above index 15 normally repeat
+ * the base colours; instead fill them with a smooth dark-blue ramp so the
+ * desktop background can fade from top to bottom instead of being one
+ * flat colour.  Indices 16..63 ramp between palette 1 and 2, 64..255 are
+ * kept as safe repeats of the base colours.
+ *
+ * The table above holds 8-bit colour values, but the VGA DAC registers
+ * are 6 bits wide: every byte going to port 0x3C9 must be reduced with
+ * >>2 first.  Writing the raw 8-bit values made the emulated DAC scale
+ * them by 4 with 8-bit wraparound, turning anything above 63 into the
+ * wrong hue (the "rainbow desktop"). */
 static void vga_load_palette(void) {
     outb(0x3C8, 0);                 /* start at DAC index 0 */
     for (int i = 0; i < 16; i++) {
-        outb(0x3C9, vga_pal16[i][0]);
-        outb(0x3C9, vga_pal16[i][1]);
-        outb(0x3C9, vga_pal16[i][2]);
+        outb(0x3C9, vga_pal16[i][0] >> 2);
+        outb(0x3C9, vga_pal16[i][1] >> 2);
+        outb(0x3C9, vga_pal16[i][2] >> 2);
     }
-    /* the remaining 240 entries reuse the same 16 colours so stray writes
-     * to high indices still show something sensible */
-    for (int i = 16; i < 256; i++) {
+    /* 48-step gradient ramp: index 16 + k, k = 0..47 */
+    for (int k = 0; k < 48; k++) {
+        u32 a = 47 - k, b = k;      /* weight: starts at colour 1, ends 2 */
+        outb(0x3C9, (u8)(((vga_pal16[1][0] >> 2) * a + (vga_pal16[2][0] >> 2) * b) / 47));
+        outb(0x3C9, (u8)(((vga_pal16[1][1] >> 2) * a + (vga_pal16[2][1] >> 2) * b) / 47));
+        outb(0x3C9, (u8)(((vga_pal16[1][2] >> 2) * a + (vga_pal16[2][2] >> 2) * b) / 47));
+    }
+    for (int i = 64; i < 256; i++) {
         const u8 *c = vga_pal16[i & 15];
-        outb(0x3C9, c[0]);
-        outb(0x3C9, c[1]);
-        outb(0x3C9, c[2]);
+        outb(0x3C9, c[0] >> 2);
+        outb(0x3C9, c[1] >> 2);
+        outb(0x3C9, c[2] >> 2);
     }
 }
 

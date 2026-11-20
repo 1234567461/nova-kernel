@@ -85,9 +85,17 @@ static const char *win_title(int type) {
 static void win_draw_frame(window_t *w) {
     u8 title_bg = w->focused ? 0x09 : 0x08;    /* focused = bright blue */
 
+    /* drop shadow: offset to the bottom-right in the darkest palette
+     * entry, so windows read as layered on the desktop */
+    gfx_fillrect(w->x + 3, w->y + 3, w->x + w->w + 2, w->y + w->h + 2, 0x00);
+
     /* body, then title bar, then a raised border */
-    gfx_fillrect(w->x + 1, w->y + 1, w->x + w->w - 2, w->y + w->h - 2, 0x07);
-    gfx_fillrect(w->x + 1, w->y + 1, w->x + w->w - 2, w->y + TITLE_H, title_bg);
+    gfx_fillrect(w->x + 1, w->y + 1, w->x + w->w - 2, w->y + w->h - 2, 0x03);
+    /* one-pixel highlight at the top of the focused title bar */
+    if (w->focused)
+        gfx_fillrect(w->x + 1, w->y + 1, w->x + w->w - 2, w->y + 1, 0x0B);
+    gfx_fillrect(w->x + 1, w->y + (w->focused ? 2 : 1),
+                 w->x + w->w - 2, w->y + TITLE_H, title_bg);
     gfx_fillrect(w->x, w->y, w->x + w->w - 1, w->y, 0x0F);
     gfx_fillrect(w->x, w->y + w->h - 1, w->x + w->w - 1, w->y + w->h - 1, 0x08);
     gfx_fillrect(w->x, w->y, w->x, w->y + w->h - 1, 0x0F);
@@ -180,12 +188,12 @@ static void win_draw_content(window_t *w) {
 }
 
 static void redraw_all(void) {
-    gfx_clear(0x01);                          /* teal desktop */
-
-    /* a light dotted grid so window motion is visible */
-    for (int y = 0; y < GFX_H - TASKBAR_H; y += 16)
-        for (int x = ((y / 16) & 1) ? 8 : 0; x < GFX_W; x += 16)
-            gfx_putpixel(x, y, 0x09);
+    /* vertical desktop gradient: the DAC ramp programmed in vga.c gives
+     * 48 shades (indices 16..63) from deep blue-grey down to slate - the
+     * old flat teal fill looked like a test pattern */
+    int gh = GFX_H - TASKBAR_H;
+    for (int y = 0; y < gh; y++)
+        gfx_fillrect(0, y, GFX_W - 1, y, 16 + (y * 47) / (gh - 1));
 
     /* paint unfocused first, focused last, so the focused window is on top */
     for (int i = 0; i < MAX_WIN; i++) {
@@ -200,7 +208,15 @@ static void redraw_all(void) {
 
     /* taskbar */
     gfx_fillrect(0, GFX_H - TASKBAR_H, GFX_W - 1, GFX_H - 1, 0x00);
+    gfx_fillrect(0, GFX_H - TASKBAR_H, GFX_W - 1, GFX_H - TASKBAR_H, 0x0B);
     gfx_drawstring(4, GFX_H - 10, "NovaOS", 0x0A, 0x00);
+    {   /* clock on the right edge: time since boot */
+        u32 t = timer_ticks();
+        char clock[16];
+        ksprintf(clock, "%u:%02u", t / 6000, (t / 100) % 60);
+        gfx_drawstring(GFX_W - 8 * (u32)strlen(clock) - 4, GFX_H - 10,
+                       clock, 0x07, 0x00);
+    }
     int bx = 60;
     for (int i = 0; i < MAX_WIN; i++) {
         if (!wins[i].used) continue;

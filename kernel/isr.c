@@ -42,6 +42,63 @@ void isr_common_handler(struct regs *r) {
         vga_write("\n", 0x4C);
         kprintf("PANIC: %s (int %u, err 0x%x, eip 0x%x)\n",
                 exceptions[r->int_no], r->int_no, r->err_code, r->eip);
+        /* full CPU state: a GP with err=0 at a random data-reading mov is
+         * almost always a bad segment register or stack, so dump them all */
+        {
+            u32 cr0, cr2, cr3, esp, efl;
+            u16 cs_v, ds_v, es_v, fs_v, gs_v, ss_v;
+            __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+            __asm__ volatile ("mov %%esp, %0" : "=r"(esp));
+            __asm__ volatile ("pushfl; popl %0" : "=r"(efl));
+            __asm__ volatile ("mov %%cs, %0" : "=r"(cs_v));
+            __asm__ volatile ("mov %%ds, %0" : "=r"(ds_v));
+            __asm__ volatile ("mov %%es, %0" : "=r"(es_v));
+            __asm__ volatile ("mov %%fs, %0" : "=r"(fs_v));
+            __asm__ volatile ("mov %%gs, %0" : "=r"(gs_v));
+            __asm__ volatile ("mov %%ss, %0" : "=r"(ss_v));
+            kprintf("  cr0=0x%x cr2=0x%x cr3=0x%x\n", cr0, cr2, cr3);
+            kprintf("  cs=0x%x ds=0x%x es=0x%x fs=0x%x gs=0x%x ss=0x%x\n",
+                    cs_v, ds_v, es_v, fs_v, gs_v, ss_v);
+            kprintf("  esp=0x%x eflags=0x%x\n", esp, efl);
+            kprintf("  eax=0x%x ecx=0x%x edx=0x%x ebx=0x%x\n",
+                    r->eax, r->ecx, r->edx, r->ebx);
+            kprintf("  esi=0x%x edi=0x%x ebp=0x%x\n",
+                    r->esi, r->edi, r->ebp);
+            /* page-table walk for the data address in EAX too */
+            {
+                u32 pdi2 = (cr3 & 0xFFFFF000);
+                u32 v2   = r->eax;
+                u32 pde2 = *(u32*)(pdi2 + (v2 >> 22) * 4);
+                if (pde2 & 1) {
+                    u32 pt2 = pde2 & 0xFFFFF000;
+                    kprintf("  pages[eax=0x%x]: pde=0x%x pte=0x%x\n",
+                            v2, pde2, *(u32*)(pt2 + ((v2 >> 12) & 0x3FF) * 4));
+                }
+            }
+            /* walk the page tables for the faulting eip and the kernel bss
+             * page: a malformed PTE that QEMU tolerates is the prime
+             * suspect for emulator-only faults */
+            {
+                u32 pdi = (cr3 & 0xFFFFF000);
+                u32 v   = r->eip;
+                u32 pdi_idx = v >> 22;
+                u32 pte_idx = (v >> 12) & 0x3FF;
+                u32 pde = *(u32*)(pdi + pdi_idx * 4);
+                if (pde & 1) {
+                    u32 pt = pde & 0xFFFFF000;
+                    u32 pte = *(u32*)(pt + pte_idx * 4);
+                    kprintf("  pages[eip]: pde=0x%x pte=0x%x\n", pde, pte);
+                    pde = *(u32*)(pdi + (0x10D000 >> 22) * 4);
+                    pt  = pde & 0xFFFFF000;
+                    kprintf("  pages[bss]: pde=0x%x pte=0x%x\n",
+                            pde, *(u32*)(pt + (0x10D000 >> 12 & 0x3FF) * 4));
+                } else {
+                    kprintf("  pages[eip]: pde=0x%x NOT PRESENT\n", pde);
+                }
+            }
+        }
         if (r->int_no == 14) {
             u32 cr2;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));

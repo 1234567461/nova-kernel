@@ -73,15 +73,37 @@ u32 sched_adopt_current(const char *name) {
 /* set up an initial stack frame so the task "returns" into fn() */
 static void task_setup_stack(task_t *t, task_fn fn) {
     u32 *sp = (u32*)(t->stack_bottom + TASK_STACK);
-    /* fake iret frame: eip=fn, cs=0x08, eflags=0x202 (IF set) */
-    *--sp = 0x202;
-    *--sp = 0x08;
-    *--sp = (u32)fn;
-    /* the isr stub pops gs fs es ds + pushad before iret: push placeholders */
-    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;       /* gs fs es ds */
-    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;       /* edi esi ebp esp */
-    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;       /* ebx edx ecx eax */
-    *--sp = 0; *--sp = 0;                             /* int_no err_code */
+    /*
+     * Build the exact frame switch_to() expects.  The ISR stubs push esp
+     * AFTER the four segment registers, so a real interrupt frame's regs*
+     * - and therefore tasks[].esp - points at the GS slot.  switch_to()
+     * restores from that address: pop gs/fs/es/ds, popal, skip int_no/err,
+     * iret.  The fake frame below was built bottom-first (esp pointing at
+     * the err slot, 48 bytes lower), so every restore pop was off by 12
+     * slots: the segment registers were loaded from err/int_no/eax/ecx
+     * (all zero) - DS/ES/FS/GS became null selectors and the task's first
+     * plain data access raised #GP err=0.  QEMU tolerates null data
+     * segments, real hardware does not, and v86 faithfully raised the
+     * fault.  Build the frame top-first now so t->esp lands on the GS
+     * slot exactly like a real interrupt frame.
+     */
+    *--sp = 0x202;                       /* eflags: IF set (iret)   */
+    *--sp = 0x08;                        /* cs                      */
+    *--sp = (u32)fn;                     /* eip: task entry point   */
+    *--sp = 0;                           /* err_code                */
+    *--sp = 0;                           /* int_no                  */
+    *--sp = 0;                           /* eax                     */
+    *--sp = 0;                           /* ecx                     */
+    *--sp = 0;                           /* edx                     */
+    *--sp = 0;                           /* ebx                     */
+    *--sp = 0;                           /* esp (ignored by popal)  */
+    *--sp = 0;                           /* ebp                     */
+    *--sp = 0;                           /* esi                     */
+    *--sp = 0;                           /* edi                     */
+    *--sp = 0x10;                        /* ds: kernel data         */
+    *--sp = 0x10;                        /* es                      */
+    *--sp = 0x10;                        /* fs                      */
+    *--sp = 0x10;                        /* gs - t->esp lands HERE  */
     t->esp = (u32)sp;
 }
 
@@ -98,7 +120,9 @@ static void task_setup_user_stack(task_t *t, u32 entry) {
     *--sp = 0; *--sp = 0;                 /* int_no err_code */
     *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* edi esi ebp esp */
     *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* ebx edx ecx eax */
-    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;   /* gs fs es ds */
+    /* same as above: these become the task's DS/ES/FS/GS on first switch.
+     * 0x23 = GDT_UDATA_SEL; a null DS would fault on the first data access. */
+    *--sp = 0x23; *--sp = 0x23; *--sp = 0x23; *--sp = 0x23;   /* gs fs es ds */
     t->esp = (u32)sp;
 }
 
@@ -307,10 +331,19 @@ static void switch_to(struct regs *frame, u32 next) {
 
     __asm__ volatile (
         "mov %0, %%esp\n\t"
-        "pop %%gs\n\t"
-        "pop %%fs\n\t"
-        "pop %%es\n\t"
-        "pop %%ds\n\t"
+        "pop %%eax\n\t"
+        /* pop into a scratch register, then MOV into the segment: the
+         * v86 emulator does not rebuild its segment cache on POP, so the
+         * first plain data access afterwards raised #GP err=0 even though
+         * the selector value was valid.  MOV into a segment register is
+         * semantically identical on real hardware. */
+        "mov %%ax, %%gs\n\t"
+        "pop %%eax\n\t"
+        "mov %%ax, %%fs\n\t"
+        "pop %%eax\n\t"
+        "mov %%ax, %%es\n\t"
+        "pop %%eax\n\t"
+        "mov %%ax, %%ds\n\t"
         "popal\n\t"
         "add $8, %%esp\n\t"
         "iret\n\t"
@@ -441,10 +474,19 @@ void sched_exit_current(void) {
 
             __asm__ volatile (
                 "mov %0, %%esp\n\t"
-                "pop %%gs\n\t"
-                "pop %%fs\n\t"
-                "pop %%es\n\t"
-                "pop %%ds\n\t"
+                "pop %%eax\n\t"
+                /* pop into a scratch register, then MOV into the segment: the
+                 * v86 emulator does not rebuild its segment cache on POP, so the
+                 * first plain data access afterwards raised #GP err=0 even though
+                 * the selector value was valid.  MOV into a segment register is
+                 * semantically identical on real hardware. */
+                "mov %%ax, %%gs\n\t"
+                "pop %%eax\n\t"
+                "mov %%ax, %%fs\n\t"
+                "pop %%eax\n\t"
+                "mov %%ax, %%es\n\t"
+                "pop %%eax\n\t"
+                "mov %%ax, %%ds\n\t"
                 "popal\n\t"
                 "add $8, %%esp\n\t"
                 "iret\n"

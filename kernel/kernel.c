@@ -17,6 +17,7 @@
 #include "user.h"
 #include "ata.h"
 #include "fat.h"
+#include "bootlog.h"
 #include "string.h"
 #include "printf.h"
 
@@ -24,6 +25,7 @@
  * round-robin scheduling is observable even with no display attached */
 static void demo_task_a(void) {
     u32 n = 0;
+    while (timer_ticks() < 300) for (volatile u32 i = 0; i < 1000; i++) ;
     for (;;) {
         if (n < 3) {
             char buf[48];
@@ -38,6 +40,7 @@ static void demo_task_a(void) {
 
 static void demo_task_b(void) {
     u32 n = 0;
+    while (timer_ticks() < 300) for (volatile u32 i = 0; i < 1000; i++) ;
     for (;;) {
         if (n < 3) {
             char buf[48];
@@ -72,61 +75,78 @@ static void try_load_user_app(void) {
 
 void kernel_main(void) {
     serial_init();
-    kprintf("NovaOS kernel v1.0 booting...\n");
+    bootlog_banner();
 
+    bootlog_start("gdt", "segments");
     gdt_init();
-    kprintf("gdt: ok\n");
+    bootlog_ok("5 entries");
 
+    bootlog_start("idt", "256 gates");
     idt_init();
-    kprintf("idt: ok (int 0x80 open to ring3)\n");
+    bootlog_ok("int 0x80 open to ring3");
 
+    bootlog_start("pic", "IRQ remap");
     pic_init();
-    kprintf("pic: ok (IRQ remap 32-47)\n");
+    bootlog_ok("0-15 -> 32-47");
 
+    bootlog_start("pit", "timer");
     timer_init(100);
-    kprintf("pit: ok (100Hz)\n");
+    bootlog_ok("100 Hz");
 
+    bootlog_start("ps2", "keyboard + mouse");
     keyboard_init();
     mouse_init();
-    kprintf("ps2: ok (keyboard + mouse)\n");
+    bootlog_ok(NULL);
 
+    bootlog_start("mm", "physical");
     mm_init();
+    bootlog_ok(NULL);
+
+    bootlog_start("heap", "kernel");
     kheap_init();
-    kprintf("memory: phys free %u KB, heap 0x%x-0x%x\n",
-            mm_free_frames() * 4, HEAP_START, HEAP_END);
+    bootlog_ok(NULL);
 
+    bootlog_start("paging", "per-process + COW");
     paging_init();
-    kprintf("paging: per-process page tables + COW (v1.0)\n");
+    bootlog_ok(NULL);
 
+    bootlog_start("security", "hardening");
     user_init();
+    if (paging_smep_enabled())
+        bootlog_ok("CR0.WP, SMEP");
+    else
+        bootlog_ok("CR0.WP (SMEP n/a)");
 
+    bootlog_start("ata", "secondary master");
     if (ata_init())
-        kprintf("ata: secondary master present\n");
+        bootlog_ok(NULL);
     else
-        kprintf("ata: no secondary drive (run with -fdb build/data.img)\n");
+        bootlog_fail("no drive");
 
-    if (fat_mount())
-        kprintf("fat: FAT12 data disk mounted\n");
-    else
-        kprintf("fat: mount failed\n");
+    bootlog_start("fat", "FAT12 volume");
+    if (fat_mount()) {
+        char note[24];
+        ksprintf(note, "%u KB free", fat_free_bytes() / 1024);
+        bootlog_ok(note);
+    } else {
+        bootlog_fail("mount failed");
+    }
 
+    bootlog_start("sched", "round-robin");
     sched_init();
     sched_adopt_current("main");        /* the boot thread becomes task 0 */
     task_create("demo-a", demo_task_a);
     task_create("demo-b", demo_task_b);
     try_load_user_app();
-    kprintf("sched: %u tasks ready\n", sched_task_count());
+    {
+        char note[16];
+        ksprintf(note, "%u tasks", sched_task_count());
+        bootlog_ok(note);
+    }
 
     sti();
+    bootlog_done();
 
     vga_init();
-    kprintf("\n===============================================\n");
-    kprintf("  NovaOS v1.0 - self-made operating system\n");
-    kprintf("  boot: stage1 -> stage2 -> pmode -> paging\n");
-    kprintf("  per-process page tables + COW fork\n");
-    kprintf("  type 'help', 'gui', 'ls', 'cat', 'run'\n");
-    kprintf("===============================================\n\n");
-
-    kprintf("shell: enter main loop (pid %u)\n", sched_current_pid());
     shell_run();
 }
