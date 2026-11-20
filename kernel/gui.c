@@ -37,6 +37,7 @@
 #include "mm.h"
 #include "kheap.h"
 #include "io.h"
+#include "timer.h"
 #include "fat.h"
 
 /* scheduler / paging live data shown in the Tasks and System Info windows */
@@ -205,7 +206,7 @@ static void win_draw_content(window_t *w) {
 
     switch (w->type) {
     case WIN_ABOUT:
-        gfx_drawstring(cx, cy,      "NovaOS v0.6",        0x04, 0x07);
+        gfx_drawstring(cx, cy,      "NovaOS v0.7",        0x04, 0x07);
         gfx_drawstring(cx, cy + 11, "home-grown kernel",   0x01, 0x07);
         gfx_drawstring(cx, cy + 21, "GDT IDT paging",      0x01, 0x07);
         gfx_drawstring(cx, cy + 31, "ring3 FAT12 mouse",   0x01, 0x07);

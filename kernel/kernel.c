@@ -18,6 +18,9 @@
 #include "ata.h"
 #include "fat.h"
 #include "bootlog.h"
+#include "net.h"
+#include "ne2k.h"
+#include "update.h"
 #include "string.h"
 #include "printf.h"
 
@@ -131,6 +134,27 @@ void kernel_main(void) {
     } else {
         bootlog_fail("mount failed");
     }
+
+    bootlog_start("net", "auto-detect");
+    if (net_init()) {
+        static const char *H = "0123456789abcdef";
+        u8 m[6];
+        char mac[20];
+        net_get_mac(m);
+        for (int i = 0, w = 0; i < 6; i++) {
+            mac[w++] = H[m[i] >> 4];
+            mac[w++] = H[m[i] & 15];
+            if (i < 5) mac[w++] = ':';
+            mac[w] = '\0';
+        }
+        bootlog_ok(mac);
+    } else {
+        bootlog_ok("none (serial update channel)");
+    }
+
+    bootlog_start("update", "over-the-air");
+    upd_init();
+    bootlog_ok("UDP 9999 / serial, crc32");
 
     bootlog_start("sched", "round-robin");
     sched_init();

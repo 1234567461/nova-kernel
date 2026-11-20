@@ -25,7 +25,8 @@ C_SRCS := kernel/entry.c kernel/gdt.c kernel/idt.c kernel/isr.c kernel/irq.c \
           kernel/timer.c kernel/keyboard.c kernel/mouse.c kernel/vga.c \
           kernel/serial.c kernel/mm.c kernel/kheap.c kernel/paging.c \
           kernel/sched.c kernel/syscall.c kernel/user.c kernel/ata.c \
-          kernel/fat.c kernel/gui.c kernel/shell.c kernel/bootlog.c kernel/kernel.c \
+          kernel/fat.c kernel/gui.c kernel/shell.c kernel/bootlog.c \
+          kernel/pci.c kernel/ne2k.c kernel/rtl8139.c kernel/net.c kernel/update.c kernel/kernel.c \
           libc/string.c libc/printf.c
 C_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
 ASM_OBJS := $(BUILD)/kernel/isr_stubs.o

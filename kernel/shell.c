@@ -27,6 +27,9 @@
 #include "paging.h"
 #include "fat.h"
 #include "user.h"
+#include "net.h"
+#include "ne2k.h"
+#include "update.h"
 
 #define LINE_MAX   128
 #define ARGV_MAX   16
@@ -144,6 +147,10 @@ static void cmd_help(void) {
         "  run <prog>        load a program from disk and run it in ring 3\n"
         "  echo <text>       print the arguments back\n"
         "  uptime            ticks since boot\n"
+        "  net               link status, MAC, IPv4, frame counters\n"
+        "  ping [ip]         three ICMP echoes (default: the gateway)\n"
+        "  update            fetch + verify + install an update bundle\n"
+        "  version           kernel version and updater state\n"
         "  gui               enter the graphical desktop\n"
         "  about             version / feature summary\n"
         "  reboot            reset the machine\n"
@@ -202,17 +209,148 @@ static void cmd_echo(char *rest) {
     putsn(rest);
 }
 
+/* ------------------------------------------------------------------ */
+/* network + updater commands                                         */
+/* ------------------------------------------------------------------ */
+static void fmt_ip(u32 ip, char *out) {
+    ksprintf(out, "%u.%u.%u.%u",
+             (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+static void fmt_mac(const u8 m[6], char *out) {
+    const char *H = "0123456789abcdef";
+    for (int i = 0; i < 6; i++) {
+        out[i * 3]     = H[m[i] >> 4];
+        out[i * 3 + 1] = H[m[i] & 15];
+        out[i * 3 + 2] = (i == 5) ? '\0' : ':';
+    }
+    out[17] = '\0';
+}
+
+static void cmd_net(void) {
+    char buf[128], sip[20], sgw[20], smask[20], smac[20];
+
+    con_write("network\n", 0x0E);
+    if (!net_up()) {
+        con_write("  link    : down (no NIC attached)\n", 0x0C);
+        con_write("  updater : serial channel to the host\n", 0x08);
+        return;
+    }
+
+    u8  mac[6];
+    u32 ip, gw, mask;
+    net_get_mac(mac);
+    net_get_ip(&ip, &gw, &mask);
+    fmt_ip(ip, sip); fmt_ip(gw, sgw); fmt_ip(mask, smask); fmt_mac(mac, smac);
+
+    ksprintf(buf, "  driver  : %s @ io 0x%x, irq %u\n",
+             net_driver_name(), net_io_base(), (u32)net_irq());
+    con_write(buf, 0x0F);
+    ksprintf(buf, "  mac     : %s\n", smac);                    con_write(buf, 0x0F);
+    ksprintf(buf, "  ip      : %s mask %s gw %s\n", sip, smask, sgw); con_write(buf, 0x0F);
+    ksprintf(buf, "  frames  : rx %u  tx %u\n",
+             net_rx_frames(), net_tx_frames());                 con_write(buf, 0x0F);
+    con_write("  try: ping / update\n", 0x08);
+}
+
+static u32 parse_ip_arg(const char *s) {
+    u32 ip = 0;
+    int part = 0;
+    while (*s && part < 4) {
+        u32 v = 0;
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (u32)(*s - '0'); s++; }
+        ip = (ip << 8) | (v & 0xFF);
+        part++;
+        if (*s == '.') s++; else break;
+    }
+    return ip;
+}
+
+static void cmd_ping(const char *arg) {
+    char buf[96], dst_s[20];
+
+    if (!net_up()) { err("ping: no NIC attached\n"); return; }
+
+    u32 dst = (arg && *arg) ? parse_ip_arg(arg) : NET_IP(10, 0, 2, 2);
+    fmt_ip(dst, dst_s);
+    ksprintf(buf, "PING %s: 32 data bytes\n", dst_s); con_write(buf, 0x0F);
+
+    int ok = 0;
+    for (int i = 1; i <= 3; i++) {
+        u32 t0 = timer_ticks();
+        int r = net_ping(dst, 1000);
+        u32 ms = (timer_ticks() - t0) * 10;
+        if (r) {
+            ksprintf(buf, "  32 bytes from %s: icmp_seq=%u time=%u ms\n", dst_s, (u32)i, ms);
+            con_write(buf, 0x0A);
+            ok++;
+        } else {
+            ksprintf(buf, "  request timeout for icmp_seq %u\n", (u32)i);
+            con_write(buf, 0x0C);
+        }
+    }
+    ksprintf(buf, "%u/%u packets received\n", (u32)ok, 3u);
+    con_write(buf, ok ? 0x0A : 0x0C);
+}
+
+static void cmd_update(void) {
+    char buf[96];
+
+    con_write("checking for updates", 0x0E);
+    con_write(net_up() ? " (udp 10.0.2.2:9999)\n" : " (serial channel)\n", 0x08);
+
+    int r = upd_check();
+    if (r == UPD_OK) {
+        con_write("  bundle verified", 0x0A);
+        ksprintf(buf, ": %u bytes, crc32 %x\n", upd_size(), upd_crc());
+        con_write(buf, 0x0A);
+        ksprintf(buf, "  version : %s (%s)\n", upd_version(), upd_channel());
+        con_write(buf, 0x0F);
+        ksprintf(buf, "  source  : %s\n", upd_source());
+        con_write(buf, 0x0F);
+        con_write("  written to UPDATE.BIN - active now, no reboot\n", 0x0B);
+        if (upd_notes()[0]) {
+            con_write("  notes:\n", 0x0E);
+            con_write(upd_notes(), 0x08);
+            con_write("\n", 0x08);
+        }
+    } else {
+        const char *why = "unknown error";
+        switch (r) {
+        case UPD_NO_LINK: why = "no link: attach a NIC or use the web build"; break;
+        case UPD_TIMEOUT: why = "no answer from the update server"; break;
+        case UPD_BAD_CRC: why = "crc mismatch - bundle rejected"; break;
+        case UPD_WRITE:   why = "could not write UPDATE.BIN"; break;
+        case UPD_PARSE:   why = "bundle missing or malformed"; break;
+        }
+        ksprintf(buf, "  failed: %s\n", why);
+        con_write(buf, 0x0C);
+    }
+}
+
+static void cmd_version(void) {
+    char buf[96];
+    ksprintf(buf, "NovaOS %s (%s) - updater source %s, %u checks\n",
+             upd_version(), upd_channel(), upd_source(), upd_checks());
+    con_write(buf, 0x0F);
+}
+
 static void cmd_about(void) {
+    char hdr[96];
+    ksprintf(hdr, "NovaOS v%s (%s) - a small operating system written from scratch\n",
+             upd_version(), upd_channel());
+    con_write(hdr, 0x0F);
     con_write(
-        "NovaOS v1.0 - a small operating system written from scratch\n"
         "  boot    : 512B stage1 -> stage2 loader -> protected mode -> kernel\n"
         "  drivers : VGA text + mode-13h graphics, PS/2 keyboard & mouse,\n"
-        "            8259 PIC, PIT, ATA PIO\n"
+        "            8259 PIC, PIT, ATA PIO, NE2000 ethernet\n"
         "  memory  : physical frame allocator, kernel heap, per-process page\n"
         "            tables with copy-on-write fork\n"
         "  sched   : preemptive round robin, private ring0 stack per task\n"
         "  syscall : int 0x80 - write getpid exit fork open read close sleep brk\n"
-        "  fs      : FAT12 reader (8.3 names, cluster chain, spc aware)\n"
+        "  fs      : FAT12 reader/writer (8.3 names, cluster chain, spc aware)\n"
+        "  net     : ARP, IPv4, ICMP echo, UDP\n"
+        "  update  : UDP 9999 or serial, CRC32 verified, applied in place\n"
         "  userland: static ELF32 loaded at 0x200000, runs in ring 3\n",
         0x0F);
 }
@@ -424,7 +562,8 @@ static void cmd_rm(const char *name) {
 static const char *builtins[] = {
     "help", "clear", "meminfo", "tasks", "ps", "ls", "cat", "hexdump",
     "run", "echo", "uptime", "gui", "about", "reboot",
-    "stat", "df", "write", "append", "rm", NULL
+    "stat", "df", "write", "append", "rm",
+    "net", "ping", "update", "version", NULL
 };
 
 /* complete "cat rea<TAB>" -> "cat readme.txt" */
@@ -504,6 +643,10 @@ static void execute(char *cmdline) {
     else if (strcmp(c, "tasks")   == 0) cmd_tasks();
     else if (strcmp(c, "ps")      == 0) cmd_ps();
     else if (strcmp(c, "uptime")  == 0) cmd_uptime();
+    else if (strcmp(c, "net")     == 0) cmd_net();
+    else if (strcmp(c, "ping")    == 0) cmd_ping(argc > 1 ? argv[1] : NULL);
+    else if (strcmp(c, "update")  == 0) cmd_update();
+    else if (strcmp(c, "version") == 0) cmd_version();
     else if (strcmp(c, "gui")     == 0) { gui_enter(); vga_clear(0x0F); }
     else if (strcmp(c, "about")   == 0) cmd_about();
     else if (strcmp(c, "ls")      == 0) cmd_ls();
