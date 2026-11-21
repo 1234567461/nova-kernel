@@ -149,6 +149,7 @@ static void cmd_help(void) {
         "  run <prog>        load a program from disk and run it in ring 3\n"
         "  echo <text>       print the arguments back\n"
         "  uptime            ticks since boot\n"
+        "  sleep <seconds>   pause the shell (2 or 0.5)\n"
         "  date              the machine's real time (CMOS RTC)\n"
         "  pkg list|avail    NovaPkg: installed packages / repo catalog\n"
         "  pkg info <name>   package details from REPO.LST\n"
@@ -211,6 +212,29 @@ static void cmd_uptime(void) {
     ksprintf(buf, "up %u ticks (%u.%02u s at 100 Hz)\n",
              t, t / 100, t % 100);
     puts(buf);
+}
+
+/* sleep <seconds> - accepts "2" and "0.5"; the PIT runs at 100 Hz */
+static void cmd_sleep(int argc, char **argv) {
+    if (argc < 2) {
+        err("sleep: usage: sleep <seconds>   (e.g. sleep 2 / sleep 0.5)\n");
+        return;
+    }
+    const char *s = argv[1];
+    u32 whole = 0, frac = 0, fdig = 0;
+    int seen = 0;
+    while (*s >= '0' && *s <= '9') { whole = whole * 10 + (u32)(*s - '0'); s++; seen = 1; }
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9' && fdig < 3) {
+            frac = frac * 10 + (u32)(*s - '0'); s++; fdig++; seen = 1;
+        }
+    }
+    if (!seen || *s) { err("sleep: invalid number\n"); return; }
+    while (fdig < 3) { frac *= 10; fdig++; }
+    u32 t = whole * 100 + (frac * 100 + 500) / 1000;
+    if (t == 0) t = 1;
+    timer_wait(t);
 }
 
 /* ------------------------------------------------------------------ */
@@ -742,7 +766,7 @@ static void cmd_rm(const char *name) {
 
 static const char *builtins[] = {
     "help", "clear", "meminfo", "tasks", "ps", "ls", "cat", "hexdump",
-    "run", "echo", "uptime", "date", "gui", "about", "reboot",
+    "run", "echo", "uptime", "date", "sleep", "gui", "about", "reboot",
     "stat", "df", "write", "append", "rm",
     "net", "ping", "update", "version", "pkg", "install", NULL
 };
@@ -824,6 +848,8 @@ static void execute(char *cmdline) {
     else if (strcmp(c, "tasks")   == 0) cmd_tasks();
     else if (strcmp(c, "ps")      == 0) cmd_ps();
     else if (strcmp(c, "uptime")  == 0) cmd_uptime();
+    else if (strcmp(c, "sleep")   == 0) cmd_sleep(argc, argv);
+    else if (strcmp(c, "usleep")  == 0) cmd_sleep(argc, argv);
     else if (strcmp(c, "date")    == 0) cmd_date();
     else if (strcmp(c, "time")    == 0) cmd_date();
     else if (strcmp(c, "pkg")     == 0) cmd_pkg(argc, argv);

@@ -32,7 +32,7 @@ static void timestamp(char out[12]) {
 
 void bootlog_banner(void) {
     emit_colored("==================================================\n", 0x08);
-    emit_colored("  NovaOS v0.9 Aurora building - the home-grown operating system\n", 0x0F);
+    emit_colored("  NovaOS v1.1 Prism building - the home-grown operating system\n", 0x0F);
     emit_colored("  stage1 -> stage2 -> pmode -> paging -> ring3\n", 0x08);
     emit_colored("==================================================\n", 0x08);
     emit_text("\n");

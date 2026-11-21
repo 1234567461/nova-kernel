@@ -14,9 +14,12 @@ int vbe_init(void) {
     ksprintf(b, "[vbe] bootinfo magic=%x\n", (u32)BI->magic);
     serial_puts(b);
     if (BI->magic != NOVA_VBE_MAGIC) return 0;
-    if (BI->bpp != 32) return 0;
-    if (BI->w < 640 || BI->w > 4096 || BI->h < 480 || BI->h > 2400) return 0;
-    if (BI->lfb == 0) return 0;
+    if (BI->bpp != 32) { serial_puts("[vbe] bpp mismatch\n"); return 0; }
+    if (BI->w < 640 || BI->w > 4096 || BI->h < 480 || BI->h > 2400) {
+        serial_puts("[vbe] resolution out of range\n");
+        return 0;
+    }
+    if (BI->lfb == 0) { serial_puts("[vbe] lfb=0\n"); return 0; }
 
     fb = (u32*)(u32)BI->lfb;
     W  = (int)BI->w;
@@ -29,7 +32,11 @@ int vbe_init(void) {
      * scribbling over random physical memory */
     volatile u32 *first = fb;
     first[0] = 0x101820;
-    if (first[0] != 0x101820) { fb = 0; return 0; }
+    if (first[0] != 0x101820) {
+        serial_puts("[vbe] lfb smoke test failed (mapping?)\n");
+        fb = 0;
+        return 0;
+    }
 
     ready = 1;
     {

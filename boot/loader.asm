@@ -24,6 +24,52 @@
 
 _start:
     cli
+    xor ax, ax
+    mov ds, ax                       # stage1 may leave ds != 0
+
+    # TRACE ch: one raw byte out to COM1.  The firmware has already
+    # programmed the UART, so a single out is enough.  This is our only
+    # reliable debug channel here: text-mode writes through [0xB8xxx]
+    # get their 16-bit address truncated in .code16, and there is no
+    # VGA escape hatch once the shell clears the screen.
+    # TRACE ch: write one char into VGA text page 1 (0xB9000..).
+    # The kernel never touches that page (mode 13h graphics live at
+    # 0xA0000, text page 0 at 0xB8000), so a post-mortem read of
+    # 0xB9000 via QEMU's monitor shows exactly how far the loader got.
+    # Serial/debugcon both proved unreliable here, so this is our
+    # ground-truth debug channel.
+    .macro TRACE ch
+    push ax
+    push bx
+    push es
+    mov ax, 0xB900
+    mov es, ax
+    mov bx, word ptr [trace_pos]
+    mov al, \ch
+    mov ah, 0x0F
+    mov word ptr es:[bx], ax
+    add bx, 2
+    mov word ptr [trace_pos], bx
+    pop es
+    pop bx
+    pop ax
+    .endm
+
+    # VBW reg val: write a word into the bochs/QEMU VBE register file
+    # (index port 0x1CE, data port 0x1CF).  This programs the extended
+    # graphics mode without any BIOS help - same as the Linux
+    # bochs-drm driver does.
+    .macro VBW reg val
+    mov dx, 0x1CE
+    mov al, \reg
+    out dx, al
+    mov dx, 0x1CF
+    mov ax, \val
+    out dx, ax
+    .endm
+
+
+    TRACE 'L'                          # stage2 entered
 
     # --- VBE: ask the firmware for a true-colour linear framebuffer -----
     # This has to happen in real mode, before paging exists.  We probe VBE
@@ -42,7 +88,30 @@ _start:
     and al, 0xFE
     out 0x92, al
 
-    call vbe_setup
+    # VBE BIOS calls need interrupts enabled: the SeaVGABIOS handlers
+    # tick-wait internally and simply never return while IF=0.  But the
+    # QEMU IDE controller keeps raising IRQ14 for the data disk, and the
+    # BIOS IDE driver never acks it, so enabling IF unmasked causes an
+    # interrupt storm that corrupts every BIOS call in flight.  Mask the
+    # ATA lines first.
+    in al, 0xA1
+    or al, 0xC0                        # IRQ14 | IRQ15
+    out 0xA1, al
+    sti
+    TRACE 'V'                          # entering vbe_setup
+
+    # call vbe_setup -- written by hand.  In .intel_syntax + .code16 GNU as
+    # still emits a *32-bit* E8 call (4-byte rel) for `call vbe_setup`,
+    # which desynchronises the instruction stream the moment it executes.
+    # We emit the 16-bit call ourselves: E8 + rel16, where rel16 counts
+    # from the address of the next instruction (i.e. the current position
+    # of `.` plus the 2 bytes the .word below occupies).
+    .byte 0xE8
+    .word vbe_setup - (. + 2)
+
+    # interrupts off from here on: the BIOS IVT is about to become
+    # meaningless in protected mode
+    cli
 
     # --- load GDT ------------------------------------------------------
     # Must use the 16-bit form explicitly: "lgdt [gdt_desc]" in .code16
@@ -137,6 +206,14 @@ pm_entry:
     # --- jump to kernel --------------------------------------------------
     jmp 0x08:0x100000
 
+    # --- back to 16-bit code --------------------------------------------
+    # vbe_setup/vbe_find run in REAL MODE and must be assembled as 16-bit
+    # code.  Inside a .code32 region as encodes every ax/bx operation with
+    # the 66h operand-size prefix ("16-bit op inside 32-bit code"), but the
+    # CPU executes them in 16-bit mode where 66h means the opposite, so
+    # each instruction eats two extra bytes and the stream desynchronises.
+    .code16
+
     # ===================================================================
     #  vbe_setup - choose a 32bpp linear-framebuffer mode and program it
     #  (real mode only).  Result goes to the bootinfo struct at 0x8F00:
@@ -150,66 +227,97 @@ pm_entry:
 vbe_setup:
     pusha
     # stage1 leaves ES pointing at the kernel staging segment (0x1000), so
-    # every "mov [0x8200], ..." below would land at 0x18200 instead.  The
+    # every "mov [0x9A00], ..." below would land at 0x18200 instead.  The
     # VBE calls write through ES:DI and read absolute addresses via DS, so
     # both have to be flat before anything else happens.
     xor ax, ax
     mov ds, ax
     mov es, ax
 
-    mov word ptr [0xB8000], 0x1F56     # 'V': probe entered
-    mov dword ptr [0x8F00], 0xEE000001 # stage 1: entered probe
+    TRACE '1'                          # entering probe
 
-    mov di, 0x8200                     # VbeInfoBlock (control info)
+    mov di, 0x9A00                     # VbeInfoBlock (control info)
     mov ax, 0x4F00
     int 0x10
-    mov word ptr [0xB8002], 0x1F41     # 'A': int 10h returned
-    mov dword ptr [0x8F00], 0xEE000002 # stage 2: int 10h returned
+    TRACE '2'                          # 4F00 ok
     cmp ax, 0x004F
     jne .vs_out
-    cmp dword ptr [0x8200], 0x41534556 # 'VESA'
+    # 'VESA' signature check.  Do NOT write "cmp dword ptr [mem], imm32"
+    # in .code16: as emits the 16-bit C7/81 form and the 4-byte immediate
+    # desynchronises the stream.  Go through a register instead, which
+    # makes as emit the 66h operand-size prefix.
+    mov eax, dword ptr [0x9A00]        # 'VESA'
+    cmp eax, 0x41534556
     jne .vs_out
-    mov word ptr [0xB8004], 0x1F42     # 'B': signature ok
-    mov dword ptr [0x8F00], 0xEE000003 # stage 3: VBE signature ok
+    TRACE '3'                          # signature ok
+    # debug: copy VideoModePtr + the first 8 mode words to 0x8300
+    mov si, word ptr [0x9A0E]          # VideoModePtr offset
+    mov ax, word ptr [0x9A10]          # VideoModePtr segment
+    mov fs, ax
+    mov di, 0x8300
+    mov cx, 8
+.dbg_copy:
+    mov ax, word ptr fs:[si]
+    mov word ptr [di], ax
+    add si, 2
+    add di, 2
+    loop .dbg_copy
 
-    mov bx, 1024
-    mov cx, 768
-    call vbe_find
+    # Direct VESA standard mode numbers instead of walking the mode list:
+    # SeaVGABIOS's 4F01 handler wedges on some planar-mode queries, so we
+    # just try the standard linear-framebuffer modes with 4F02 and read
+    # the parameters back afterwards.
+    # SeaVGABIOS's 4F02 only knows modes 0x100-0x107 (it returns 0x014F
+    # for anything else), but its 4F01 happily reports the VESA standard
+    # modes.  So: query parameters with 4F01, then program the bochs/QEMU
+    # VBE register file directly - exactly what the Linux bochs-drm
+    # driver does, no BIOS mode-set support required.
+    TRACE 'T'
+    mov cx, 0x11C                      # 1024x768x32 (SeaVGABIOS 32bpp modes)
+    call vbe_params
     test ax, ax
-    jnz .vs_got
-    mov bx, 800
-    mov cx, 600
-    call vbe_find
+    jz .prog
+    mov cx, 0x118                      # 800x600x32
+    call vbe_params
     test ax, ax
-    jnz .vs_got
-    mov bx, 640
-    mov cx, 480
-    call vbe_find
+    jz .prog
+    mov cx, 0x114                      # 640x480x32
+    call vbe_params
     test ax, ax
-    jz .vs_out
-    mov word ptr [0xB8006], 0x1F43     # 'C': mode found
-    mov dword ptr [0x8F00], 0xEE000004 # stage 4: mode found
-.vs_got:
-    or ax, 0x4000                      # bit 14: use linear framebuffer
-    mov bx, ax
+    jnz .vs_out
+.prog:
+    TRACE 'P'                          # parameters in hand
+    # the scan found SeaVGABIOS's own mode number (e.g. 0x144 for
+    # 1024x768x32) - program it through the BIOS so every register
+    # sequence is exactly what the firmware intends
+    mov bx, word ptr [0x8F26]          # best mode from the scan
+    or bx, 0x4000                      # use the linear framebuffer
     mov ax, 0x4F02
     int 0x10
+    mov word ptr [0x8320], ax          # debug: 4F02 rc
     cmp ax, 0x004F
     jne .vs_out
-
-    # mode is live: publish its parameters
-    mov dword ptr [0x8F00], 0x31454256 # 'VBE1'
+    TRACE 'E'                          # mode live
+    # publish the parameters read from the 4F01 buffer.
+    # NOTE: "mov dword ptr [mem], imm32" is broken in .code16 (as emits
+    # the 16-bit C7 form and the stream desynchronises).  Every 32-bit
+    # store goes through a register so as emits the 66h prefix.
+    mov eax, 0x31454256                # 'VBE1'
+    mov dword ptr [0x8F00], eax
+    # NB: `mov ax, [mem]` does not clear the high half of eax - zero it
+    # first or the stale 0x3145 ('VE') ends up in the published dword.
     xor eax, eax
-    mov ax, word ptr [0x8014]          # XResolution
+    mov ax, word ptr [0x9C12]          # XResolution
     mov dword ptr [0x8F04], eax
     xor eax, eax
-    mov ax, word ptr [0x8016]          # YResolution
+    mov ax, word ptr [0x9C14]          # YResolution
     mov dword ptr [0x8F08], eax
     xor eax, eax
-    mov ax, word ptr [0x8012]          # BytesPerScanLine
+    mov ax, word ptr [0x9C10]          # BytesPerScanLine
     mov dword ptr [0x8F0C], eax
-    mov dword ptr [0x8F10], 32
-    mov eax, dword ptr [0x802A]        # PhysBasePtr
+    mov eax, 32                        # bpp
+    mov dword ptr [0x8F10], eax
+    mov eax, dword ptr [0x9C28]        # PhysBasePtr
     mov dword ptr [0x8F14], eax
 .vs_out:
     popa
@@ -220,63 +328,102 @@ vbe_setup:
 #    in : bx = width, cx = height
 #    out: ax = mode number (0 = not found)
 # -----------------------------------------------------------------------
-vbe_find:
-    push bx
-    push cx
-    push dx
+# -----------------------------------------------------------------------
+#  vbe_params - 4F01 the mode in CX into the buffer at 0x9C00 and verify
+#  it is a 32bpp linear-framebuffer mode.
+#    in : cx = VESA mode number
+#    out: ax = 0 on success (buffer filled), 1 on failure
+# -----------------------------------------------------------------------
+vbe_params:
+    # walk the mode list reported by 4F00 and take the first mode that is
+    # supported, LFB-capable and 32bpp, preferring 1024x768 over 800x600
+    # and 640x480.  The planar modes 0x102/0x104/0x106 are blacklisted:
+    # the SeaVGABIOS 4F01 handler never returns for them in our setup.
     push si
     push di
-    push fs
-    push bp
-
-    mov bp, bx                         # bp = wanted width
-    mov bx, cx                         # bx = wanted height (cx is needed
-                                       #      by 4F01 for the mode number)
-    mov si, word ptr [0x820E]          # VideoModePtr offset
-    mov ax, word ptr [0x8210]          # VideoModePtr segment
+    mov si, word ptr [0x9A0E]          # VideoModePtr offset
+    mov ax, word ptr [0x9A10]          # VideoModePtr segment
     mov fs, ax
-.vf_loop:
+.scan:
     mov dx, word ptr fs:[si]
     cmp dx, 0xFFFF
-    je .vf_none
+    je .scan_none
     add si, 2
+    cmp dx, 0x0102                     # blacklist planar wedge modes
+    je .scan
+    cmp dx, 0x0104
+    je .scan
+    cmp dx, 0x0106
+    je .scan
     push si
     mov ax, 0x4F01
     mov cx, dx
-    mov di, 0x8000
+    mov di, 0x9C00
     int 0x10
     pop si
+    # the BIOS clobbers FS; reload the mode-list segment every iteration
+    push ax
+    mov ax, word ptr [0x9A10]
+    mov fs, ax
+    pop ax
     cmp ax, 0x004F
-    jne .vf_loop
-    mov ax, word ptr [0x8000]          # ModeAttributes
+    jne .scan
+    mov ax, word ptr [0x9C00]          # ModeAttributes
     and ax, 0x0081                     # supported | linear framebuffer
     cmp ax, 0x0081
-    jne .vf_loop
-    cmp byte ptr [0x801B], 32          # BitsPerPixel
-    jne .vf_loop
-    cmp word ptr [0x8014], bp          # XResolution
-    jne .vf_loop
-    cmp word ptr [0x8016], bx          # YResolution
-    jne .vf_loop
-    mov ax, dx                         # found it
-    jmp .vf_done
-.vf_none:
-    xor ax, ax
-.vf_done:
-    pop bp
-    pop fs
+    jne .scan
+    cmp byte ptr [0x9C19], 32          # BitsPerPixel (MIB+0x19)
+    jne .scan
+    cmp word ptr [0x9C12], 1024        # prefer 1024x768, else keep scanning
+    je .scan_hit_w
+    cmp word ptr [0x9C12], 800
+    je .scan_hit_maybe
+    cmp word ptr [0x9C12], 640
+    jne .scan
+    mov bx, 1                          # score 1: 640x480
+    jmp .scan_maybe
+.scan_hit_w:
+    mov bx, 3                          # score 3: 1024x768
+    jmp .scan_maybe
+.scan_hit_maybe:
+    mov bx, 2                          # score 2: 800x600
+.scan_maybe:
+    mov ax, dx
+    mov word ptr [0x8F20], ax          # remember current candidate
+    mov word ptr [0x8F22], bx          # score
+    # keep looking for something better, but remember this one
+    mov ax, word ptr [0x8F24]          # best score so far (0 = none)
+    cmp bx, ax
+    jbe .scan
+    mov ax, dx
+    mov word ptr [0x8F26], ax          # best mode so far
+    mov word ptr [0x8F24], bx
+    jmp .scan
+.scan_none:
+    mov ax, word ptr [0x8F26]          # best mode found (0 = none)
+    test ax, ax
+    jz .scan_fail
+    mov cx, ax                         # re-query the winner into the buffer
+    mov ax, 0x4F01
+    mov di, 0x9C00
+    int 0x10
+    push ax
+    mov ax, word ptr [0x9A10]
+    mov fs, ax
+    pop ax
+    xor ax, ax                         # success (buffer holds the params)
     pop di
     pop si
-    pop dx
-    pop cx
-    pop bx
+    ret
+.scan_fail:
+    mov ax, 1
+    pop di
+    pop si
     ret
 
-    # ===================================================================
-    #  GDT: null, code (base0, 4GB, exec/read), data (base0, 4GB, rw)
-    #  (kept in .text so the flat binary layout is predictable)
-    # ===================================================================
-    .align 8
+trace_pos:
+    .word 0
+
 gdt_start:
     .quad 0x0000000000000000        # null descriptor
     .quad 0x00CF9A000000FFFF        # code: base 0, limit 4GB, DPL0, exec/read

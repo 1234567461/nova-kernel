@@ -255,7 +255,7 @@ static void topbar(void) {
     gfx_round(PX(16), cy - PX(6), PX(16) + PX(12), cy + PX(6), PX(6), accent);
     gfx_str(PX(36), cy - gfx_strh(SC) / 2, "NovaOS", C_TEXT, SC);
     gfx_str(PX(36) + gfx_strw("NovaOS", SC) + PX(8),
-            cy - gfx_strh(SM) / 2, "1.0 Sun", C_MUTED, SM);
+            cy - gfx_strh(SM) / 2, "1.1 Prism", C_MUTED, SM);
 
     /* clock from the CMOS RTC */
     rtc_time t;
@@ -802,7 +802,7 @@ static void draw_about(win_t *w) {
     gfx_round(cx - PX(34), cy, cx + PX(34), cy + PX(68), PX(18), accent);
     gfx_str(cx - PX(12), cy + PX(22), "N", RGB(12, 18, 30), 5);
 
-    text_c(cx, cy + PX(88), "NovaOS 1.0 Sun", C_TEXT, SC + 1);
+    text_c(cx, cy + PX(88), "NovaOS 1.1 Prism", C_TEXT, SC + 1);
     text_c(cx, cy + PX(88) + PX(30), "a home-grown operating system", C_DIM, SM);
     text_c(cx, cy + PX(88) + PX(52),
            "boot sector / kernel / GUI written from scratch", C_MUTED, SM);
