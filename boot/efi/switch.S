@@ -22,6 +22,8 @@
     .text
     .code64
     .globl efi_go32
+    .hidden efi_go32          # keep the call site direct (no GOT indirection)
+    .type efi_go32, @function
 efi_go32:
     cli
     lea  gdt_desc(%rip), %rax

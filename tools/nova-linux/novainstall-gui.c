@@ -1,5 +1,5 @@
 /* ============================================================================
- *  Nova-Linux 0.9 (Aurora) - graphical install wizard
+ *  Nova-Linux 1.0 (Sun) - graphical install wizard
  *
  *  Self-contained: draws on /dev/fb0 (bochs/virtio-gpu/qxl DRM fbdev),
  *  reads keyboard + mouse/touch from /dev/input/event* (evdev is built-in).
@@ -18,9 +18,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <termios.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdint.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -78,6 +80,14 @@ static void center(int y, const char *s, uint32_t c, int scale) {
 /* ------------------------------------------------------------------ ui */
 #define MAXBTN 8
 typedef struct { int x, y, w, h; const char *label; int id; } Btn;
+/* Resolution-independent layout: the installer must fill whatever screen it
+ * is given (a 4K panel must not show a stamp-sized dialog).  FS is the font
+ * scale and every position below is expressed as a fraction of W/H. */
+static int FS = 2;
+static int vw(int pct) { return W * pct / 100; }
+static int vh(int pct) { return H * pct / 100; }
+static int pxs(int px) { return px * FS / 2; }   /* design px @FS=2 -> screen */
+
 static Btn btns[MAXBTN];
 static int nbtn = 0, sel = 0, mx = -100, my = -100;
 
@@ -90,11 +100,13 @@ static void draw_btns(void) {
     for (int i = 0; i < nbtn; i++) {
         Btn *b = &btns[i];
         int on = (i == sel);
-        rect(b->x - 4, b->y - 4, b->w + 8, b->h + 8, on ? C_ACCENT : C_PANEL);
+        int tw = (int)strlen(b->label) * FONT_W * FS;
+        if (tw + 10 * FS > b->w) b->w = tw + 10 * FS;   /* never clip a label */
+        int pad = FS;
+        rect(b->x - pad, b->y - pad, b->w + 2 * pad, b->h + 2 * pad, on ? C_ACCENT : C_PANEL);
         rect(b->x, b->y, b->w, b->h, on ? 0x3A2A20 : C_PANEL);
-        int tw = (int)strlen(b->label) * FONT_W * 2;
-        text(b->x + (b->w - tw) / 2, b->y + (b->h - FONT_H * 2) / 2, b->label,
-             on ? C_ACCENT : C_TEXT, 2);
+        text(b->x + (b->w - tw) / 2, b->y + (b->h - FONT_H * FS) / 2, b->label,
+             on ? C_ACCENT : C_TEXT, FS);
     }
 }
 static void draw_cursor(void) {
@@ -276,54 +288,70 @@ static int tgpt, mode_pnum = 2;
 static int result_ok = 0;
 static int step_i = 0, step_n = 8;
 
+#define HINT_H (7 * FS + 6)
+
+static int btn_h(void) { return 8 * FS + 14; }
+static int btn_gap(void) { return 3 * FS + 8; }
+
 static void header(void) {
-    rect(0, 0, W, 64, C_PANEL);
-    rect(0, 64, W, 3, C_ACCENT);
-    text(24, 18, "Nova-Linux 0.9 (Aurora)", C_TEXT, 2);
-    text(W - 200, 26, "Install Wizard", C_ACCENT, 1);
+    int hh = 20 * FS + 4;
+    rect(0, 0, W, hh, C_PANEL);
+    rect(0, hh, W, 3, C_ACCENT);
+    text(6 * FS, (hh - FONT_H * FS) / 2, "Nova-Linux 1.0 (Sun)", C_TEXT, FS);
+    const char *r = "Install Wizard";
+    int rw = (int)strlen(r) * FONT_W * FS;
+    text(W - rw - 6 * FS, (hh - FONT_H * FS) / 2, r, C_ACCENT, FS);
 }
 
 static void scr_mode(void) {
     btn_clear();
     header();
-    center(H / 4, "Welcome to Nova-Linux", C_TEXT, 3);
-    center(H / 4 + 44, "Choose what to do:", C_DIM, 2);
-    int bw = 640, bx = (W - bw) / 2, by = H / 2 - 120;
-    btn_add(bx, by,          bw, 72, "Erase entire disk & install", 1);
-    btn_add(bx, by + 88,     bw, 72, "Install alongside existing OS (free space)", 2);
-    btn_add(bx, by + 176,    bw, 72, "Live shell (no install)", 3);
+    int bh = 9 * FS + 18, gap = btn_gap();
+    int bw = vw(52); if (bw > 980) bw = 980; if (bw < 420) bw = 420;
+    int bx = (W - bw) / 2;
+    int by = vh(36);
+    const char *items[3] = { "Erase entire disk & install",
+                             "Install alongside existing OS (free space)",
+                             "Live shell (no install)" };
+    for (int i = 0; i < 3; i++)
+        btn_add(bx, by + i * (bh + gap), bw, bh, items[i], i + 1);
+    center(vh(15), "Welcome to Nova-Linux", C_TEXT, FS + 2);
+    center(vh(15) + (FS + 2) * FONT_H + 5 * FS, "Choose what to do:", C_DIM, FS);
     draw_btns(); flush();
 }
 
 static void scr_disk(void) {
     btn_clear();
     header();
-    center(H / 4, mode ? "Install alongside - pick target disk" :
-                        "Erase & install - pick target disk", C_TEXT, 2);
+    center(vh(11), mode ? "Install alongside - pick target disk"
+                        : "Erase & install - pick target disk", C_TEXT, FS + 1);
+    int bw = vw(56); if (bw > 1000) bw = 1000; if (bw < 420) bw = 420;
+    int bx = (W - bw) / 2;
+    int bh = btn_h();
     if (!ndisk) {
-        center(H / 2, "No disks found in this machine.", C_WARN, 2);
-        btn_add((W - 320) / 2, H - 140, 320, 60, "Back", 0);
+        center(vh(40), "No disks found in this machine.", C_WARN, FS);
+        btn_add(bx, H - HINT_H - bh - 6 * FS, bw, bh, "Back", 0);
         draw_btns(); flush(); return;
     }
-    int bw = 680, bx = (W - bw) / 2, by = H / 2 - 100;
+    int by = vh(24);
     char line[96];
     for (int i = 0; i < ndisk && i < MAXBTN - 1; i++) {
-        snprintf(line, sizeof line, "/dev/%s  -  %ld MB", disks[i].dev, disks[i].mb);
-        btn_add(bx, by + i * 80, bw, 64, "", 10 + i);
+        snprintf(line, sizeof line, "/dev/%s   -   %ld MB", disks[i].dev, disks[i].mb);
+        btn_add(bx, by + i * (bh + btn_gap()), bw, bh, "", 10 + i);
         Btn *b = &btns[nbtn - 1];
         int on = (nbtn - 1 == sel);
-        rect(b->x - 4, b->y - 4, b->w + 8, b->h + 8, on ? C_ACCENT : C_PANEL);
+        rect(b->x - FS, b->y - FS, b->w + 2 * FS, b->h + 2 * FS, on ? C_ACCENT : C_PANEL);
         rect(b->x, b->y, b->w, b->h, on ? 0x3A2A20 : C_PANEL);
-        text(b->x + 24, b->y + (b->h - FONT_H) / 2, line, on ? C_ACCENT : C_TEXT, 1);
+        text(b->x + 6 * FS, b->y + (b->h - FONT_H * FS) / 2, line, on ? C_ACCENT : C_TEXT, FS);
     }
-    btn_add((W - 320) / 2, H - 130, 320, 60, "Back", 0);
+    btn_add(bx, H - HINT_H - bh - 6 * FS, bw, bh, "Back", 0);
     draw_btns(); flush();
 }
 
 static void scr_confirm(const char *dev, long fstart, long fsize) {
     btn_clear();
     header();
-    center(H / 4, "Ready to install", C_TEXT, 3);
+    center(vh(12), "Ready to install", C_TEXT, FS + 2);
     char line[128];
     if (mode) {
         long mb = fsize * 512 / 1024 / 1024;
@@ -332,30 +360,35 @@ static void scr_confirm(const char *dev, long fstart, long fsize) {
     } else {
         snprintf(line, sizeof line, "Mode: ERASE ALL DATA on /dev/%s", dev);
     }
-    center(H / 2 - 60, line, mode ? C_TEXT : C_WARN, 2);
-    center(H / 2 - 20, mode ? "Your existing system will NOT be touched."
-                            : "Everything on this disk will be destroyed!",
-           mode ? C_DIM : C_WARN, 2);
-    center(H / 2 + 30, mode ? "After install: run 'update-grub' in your existing OS"
-                            : "Nova-Linux will own the whole disk.", C_DIM, 1);
-    int bw = 640, bx = (W - bw) / 2, by = H / 2 + 90;
-    btn_add(bx, by, bw, 72, mode ? "Install now (safe)" : "ERASE & INSTALL NOW", 99);
-    btn_add(bx, by + 88, bw, 60, "Cancel", 0);
+    int y = vh(30);
+    center(y, line, mode ? C_TEXT : C_WARN, FS);
+    center(y + FONT_H * FS + 4 * FS, mode ? "Your existing system will NOT be touched."
+                                          : "Everything on this disk will be destroyed!",
+           mode ? C_DIM : C_WARN, FS);
+    center(y + 2 * (FONT_H * FS + 4 * FS),
+           mode ? "After install: run 'update-grub' in your existing OS"
+                : "Nova-Linux will own the whole disk.", C_DIM, FS - 1 < 1 ? 1 : FS - 1);
+    int bw = vw(50); if (bw > 860) bw = 860; if (bw < 420) bw = 420;
+    int bx = (W - bw) / 2, bh = 8 * FS + 16;
+    btn_add(bx, vh(62), bw, bh, mode ? "Install now (safe)" : "ERASE & INSTALL NOW", 99);
+    btn_add(bx, vh(62) + bh + btn_gap() + 4 * FS, bw, bh - 4 * FS, "Cancel", 0);
     draw_btns(); flush();
 }
 
 static void scr_run(void) {
     btn_clear();
     header();
-    center(100, "Installing Nova-Linux ...", C_TEXT, 3);
-    rect((W - 700) / 2, 220, 700, 26, C_PANEL);
-    rect((W - 700) / 2, 220, 700 * step_i / step_n, 26, C_ACCENT);
+    center(vh(13), "Installing Nova-Linux ...", C_TEXT, FS + 1);
+    int bw = vw(66), bx = (W - bw) / 2, bh = 3 * FS + 10;
+    rect(bx, vh(24), bw, bh, C_PANEL);
+    rect(bx, vh(24), bw * step_i / step_n, bh, C_ACCENT);
     char buf[1200];
     tail_log(buf, sizeof buf, 14);
-    int y = 300;
-    for (char *s = strtok(buf, "\n"); s; s = strtok(NULL, "\n")) {
-        text(80, y, s, C_DIM, 1); y += 20;
-        if (y > H - 60) break;
+    int sc = FS - 1 < 1 ? 1 : FS - 1;
+    int y = vh(34);
+    for (char *t = strtok(buf, "\n"); t; t = strtok(NULL, "\n")) {
+        text(6 * FS, y, t, C_DIM, sc); y += FONT_H * sc + 3;
+        if (y > H - HINT_H - FONT_H * sc) break;
     }
     flush();
 }
@@ -363,15 +396,18 @@ static void scr_run(void) {
 static void scr_done(int ok) {
     btn_clear();
     header();
-    center(H / 3, ok ? "Installation complete!" : "Installation failed", ok ? C_OK : C_WARN, 3);
-    center(H / 3 + 50, ok ? "Nova-Linux is on your disk." : "See log above / live shell for details.",
-           C_DIM, 2);
-    int bw = 560, bx = (W - bw) / 2, by = H / 2 + 60;
+    center(vh(18), ok ? "Installation complete!" : "Installation failed", ok ? C_OK : C_WARN, FS + 2);
+    center(vh(18) + (FS + 2) * FONT_H + 5 * FS,
+           ok ? "Nova-Linux is on your disk." : "See log above / live shell for details.",
+           C_DIM, FS);
+    int bw = vw(46); if (bw > 760) bw = 760; if (bw < 380) bw = 380;
+    int bx = (W - bw) / 2, bh = 8 * FS + 16;
+    int by = vh(50);
     if (ok) {
-        btn_add(bx, by, bw, 72, "Reboot into Nova-Linux", 101);
-        btn_add(bx, by + 88, bw, 60, "Exit to shell", 102);
+        btn_add(bx, by, bw, bh, "Reboot into Nova-Linux", 101);
+        btn_add(bx, by + bh + btn_gap() + 2 * FS, bw, bh - 4 * FS, "Exit to shell", 102);
     } else {
-        btn_add(bx, by, bw, 60, "Exit to shell", 102);
+        btn_add(bx, by, bw, bh, "Exit to shell", 102);
     }
     draw_btns(); flush();
 }
@@ -379,8 +415,9 @@ static void scr_done(int ok) {
 static void scr_msg(void) {
     btn_clear();
     header();
-    center(H / 3, msg, C_WARN, 2);
-    btn_add((W - 320) / 2, H / 2 + 40, 320, 60, "OK", 0);
+    center(vh(26), msg, C_WARN, FS);
+    int bw = vw(30); if (bw < 260) bw = 260;
+    btn_add((W - bw) / 2, vh(50), bw, btn_h(), "OK", 0);
     draw_btns(); flush();
 }
 
@@ -388,9 +425,23 @@ static void scr_msg(void) {
 static void scr_confirm_w(void) { scr_confirm(tdev, tfstart, tfsize); }
 static void scr_done_w(void) { scr_done(result_ok); }
 static void (*screens[])(void) = { scr_mode, scr_disk, scr_confirm_w, scr_run, scr_done_w, scr_msg };
+/* --- persistent help strip: the single most common complaint was
+ *     "I don't know how to choose", so it is always on screen ---------- */
+static void hint_bar(void) {
+    int hs = 7 * FS + 6;
+    int y = H - hs;
+    rect(0, y, W, hs, C_PANEL);
+    rect(0, y, W, 2, C_ACCENT);
+    const char *h = "UP/DN or TAB move   ENTER or SPACE choose   1/2/3 shortcuts   CLICK / TAP a box";
+    int sc = FS > 1 ? FS - 1 : 1;
+    int tw = (int)strlen(h) * FONT_W * sc;
+    text(tw > W ? 0 : (W - tw) / 2, y + (hs - FONT_H * sc) / 2, h, C_DIM, sc);
+}
 static void redraw(void) {
     rect(0, 0, W, H, C_BG);
     screens[scr]();
+    hint_bar();
+    if (mx >= 0) draw_cursor();
 }
 
 /* ---------------------------------------------------------- transitions */
@@ -451,102 +502,335 @@ static void activate(int id) {
 }
 
 /* ------------------------------------------------------------- input */
-static int evfd[8], nev = 0;
-static int relx = 0, rely = 0, btn_down = 0;
+/*
+ *  Input is the part that kept failing on real machines, so it is written
+ *  defensively:
+ *
+ *   - every /dev/input/event* is opened and classified through EVIOCGBIT, so
+ *     we do not care which node is the keyboard, which is the mouse and which
+ *     is the touch panel (order differs per machine);
+ *   - BTN_LEFT *and* BTN_TOUCH / BTN_TOOL_FINGER / ABS_MT_TRACKING_ID are all
+ *     accepted as "press" - this is what makes touch panels work at all;
+ *   - absolute ranges come from EVIOCGABS instead of a hard-coded 1024x768,
+ *     and ABS_MT_POSITION_X/Y is handled as well as plain ABS_X/Y;
+ *   - key-up is no longer swallowed: a press is latched and the release
+ *     activates whatever button is under the pointer, with a 700 ms fallback
+ *     for panels that never report a release;
+ *   - stdin is read in raw mode as a second channel, so the console keyboard
+ *     still works if the evdev nodes are missing or unreadable;
+ *   - devices are re-scanned every 3 s to survive hotplug ordering.
+ */
+#define BITS(x)        (((x) + 7) / 8)
+#define MAXDEV         12
+
+typedef struct {
+    int  fd;
+    char path[48];
+    int  is_abs;
+    int  xcode, ycode;
+    int  xmin, xmax, ymin, ymax;
+    int  has_button;
+    int  rx, ry;                 /* last raw absolute value */
+} Dev;
+
+static Dev  dv[MAXDEV];
+static int  ndev = 0;
+static int  press_btn = -1;      /* button index held down */
+static long press_ms = 0;
+static int  stdin_raw = 0;
+static int  ev_kbd = 0;          /* an evdev keyboard exists */
+static int  dirty = 1;
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+static int bit_is_set(const unsigned char *bits, int n) {
+    return (bits[n >> 3] >> (n & 7)) & 1;
+}
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static int dev_index(const char *path) {
+    for (int i = 0; i < ndev; i++) if (!strcmp(dv[i].path, path)) return i;
+    return -1;
+}
+
+static void add_dev(const char *path) {
+    if (ndev >= MAXDEV || dev_index(path) >= 0) return;
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) return;
+
+    unsigned char evbit[BITS(EV_CNT)]  = {0};
+    unsigned char keybit[BITS(KEY_CNT)] = {0};
+    unsigned char absbit[BITS(ABS_CNT)] = {0};
+    if (ioctl(fd, EVIOCGBIT(0, sizeof evbit), evbit) < 0) { close(fd); return; }
+    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keybit), keybit);
+    ioctl(fd, EVIOCGBIT(EV_ABS, sizeof absbit), absbit);
+
+    Dev d;
+    memset(&d, 0, sizeof d);
+    d.fd = fd;
+    strncpy(d.path, path, sizeof d.path - 1);
+    d.xcode = d.ycode = -1;
+
+    if (bit_is_set(absbit, ABS_MT_POSITION_X) && bit_is_set(absbit, ABS_MT_POSITION_Y)) {
+        d.is_abs = 1; d.xcode = ABS_MT_POSITION_X; d.ycode = ABS_MT_POSITION_Y;
+    } else if (bit_is_set(absbit, ABS_X) && bit_is_set(absbit, ABS_Y)) {
+        d.is_abs = 1; d.xcode = ABS_X; d.ycode = ABS_Y;
+    }
+    d.has_button = bit_is_set(keybit, BTN_LEFT) || bit_is_set(keybit, BTN_TOUCH) ||
+                   bit_is_set(keybit, BTN_TOOL_FINGER) || bit_is_set(keybit, BTN_STYLUS);
+    if (bit_is_set(keybit, KEY_ENTER) || bit_is_set(keybit, KEY_A) ||
+        bit_is_set(keybit, KEY_Q)) ev_kbd = 1;
+
+    d.xmin = 0; d.xmax = 1023; d.ymin = 0; d.ymax = 767;
+    if (d.is_abs) {
+        struct input_absinfo ai;
+        if (ioctl(fd, EVIOCGABS(d.xcode), &ai) == 0 && ai.maximum > ai.minimum) {
+            d.xmin = ai.minimum; d.xmax = ai.maximum;
+        }
+        if (ioctl(fd, EVIOCGABS(d.ycode), &ai) == 0 && ai.maximum > ai.minimum) {
+            d.ymin = ai.minimum; d.ymax = ai.maximum;
+        }
+    }
+    d.rx = d.xmin + (d.xmax - d.xmin) / 2;
+    d.ry = d.ymin + (d.ymax - d.ymin) / 2;
+    dv[ndev++] = d;
+}
 
 static void open_inputs(void) {
     DIR *d = opendir("/dev/input");
     if (!d) return;
     struct dirent *e;
-    while ((e = readdir(d)) && nev < 8) {
+    while ((e = readdir(d))) {
         if (strncmp(e->d_name, "event", 5)) continue;
         char p[64];
         snprintf(p, sizeof p, "/dev/input/%s", e->d_name);
-        int fd = open(p, O_RDONLY | O_NONBLOCK);
-        if (fd >= 0) evfd[nev++] = fd;
+        add_dev(p);
     }
     closedir(d);
 }
 
-static void pump_events(void) {
-    fd_set r; FD_ZERO(&r);
-    int mx_fd = 0;
-    for (int i = 0; i < nev; i++) { FD_SET(evfd[i], &r); if (evfd[i] > mx_fd) mx_fd = evfd[i]; }
-    struct timeval tv = { 0, 50000 };   /* 50ms -> blink/poll */
-    if (select(mx_fd + 1, &r, NULL, NULL, &tv) <= 0) return;
-    for (int i = 0; i < nev; i++) {
-        if (!FD_ISSET(evfd[i], &r)) continue;
-        struct input_event ev;
-        while (read(evfd[i], &ev, sizeof ev) == sizeof ev) {
-            if (ev.type == EV_KEY) {
-                { FILE *d = fopen("/dev/ttyS0", "w"); if (d) { fprintf(d, "[gui] key %d val %d\n", ev.code, ev.value); fclose(d); } }
-                if (ev.value == 0) continue;      /* ignore key-up */
-                int code = ev.code;
-                int id = -1;
-                if (code == KEY_UP || code == KEY_LEFT)  { sel = (sel + nbtn - 1) % nbtn; redraw(); }
-                else if (code == KEY_DOWN || code == KEY_RIGHT) { sel = (sel + 1) % nbtn; redraw(); }
-                else if (code == KEY_ENTER || code == KEY_KPENTER || code == KEY_SPACE) activate(btns[sel].id);
-                else if (code == KEY_ESC) { if (scr == SCR_DISK || scr == SCR_CONFIRM || scr == SCR_MSG) activate(0); }
-                else if (code >= KEY_1 && code <= KEY_9) { id = code - KEY_1 + 1; if (scr == SCR_MODE) activate(id); }
-                (void)id;
-            } else if (ev.type == EV_REL) {
-                if (ev.code == REL_X) mx += ev.value;
-                if (ev.code == REL_Y) my += ev.value;
-                if (mx < 0) mx = 0; if (my < 0) my = 0;
-                if (mx > W - 1) mx = W - 1; if (my > H - 1) my = H - 1;
-                redraw();
-            } else if (ev.type == EV_ABS) {
-                if (ev.code == ABS_X) { if (mx < 0) mx = ev.value * W / 1024; else mx = ev.value * W / 1024; }
-                if (ev.code == ABS_Y) { if (my < 0) my = ev.value * H / 768; else my = ev.value * H / 768; }
-                redraw();
-            } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-                if (btn_down) { /* click release handled below */ }
-            }
-            if (ev.type == EV_KEY && ev.code == BTN_LEFT) {
-                if (ev.value == 1) {
-                    btn_down = 1;
-                    /* hit test */
-                    for (int b = 0; b < nbtn; b++) {
-                        Btn *bt = &btns[b];
-                        if (mx >= bt->x - 4 && mx <= bt->x + bt->w + 4 &&
-                            my >= bt->y - 4 && my <= bt->y + bt->h + 4) {
-                            sel = b; redraw();
-                            break;
-                        }
-                    }
-                } else if (ev.value == 0 && btn_down) {
-                    btn_down = 0;
-                    for (int b = 0; b < nbtn; b++) {
-                        Btn *bt = &btns[b];
-                        if (mx >= bt->x - 4 && mx <= bt->x + bt->w + 4 &&
-                            my >= bt->y - 4 && my <= bt->y + bt->h + 4) {
-                            activate(bt->id);
-                            break;
-                        }
-                    }
-                }
-            }
+/* absolute -> screen, using the device's own reported range */
+static void set_abs(Dev *d, int rx, int ry) {
+    int xr = d->xmax - d->xmin, yr = d->ymax - d->ymin;
+    if (xr <= 0) xr = 1;
+    if (yr <= 0) yr = 1;
+    int sx = (rx - d->xmin) * (W - 1) / xr;
+    int sy = (ry - d->ymin) * (H - 1) / yr;
+    sx = clampi(sx, 0, W - 1);
+    sy = clampi(sy, 0, H - 1);
+    if (sx != mx || sy != my) { mx = sx; my = sy; dirty = 1; }
+}
+
+static int hit_test(void) {
+    for (int b = 0; b < nbtn; b++) {
+        Btn *t = &btns[b];
+        if (mx >= t->x - 8 && mx <= t->x + t->w + 8 &&
+            my >= t->y - 8 && my <= t->y + t->h + 8) return b;
+    }
+    return -1;
+}
+
+static void pointer_down(void) {
+    if (mx < 0 || my < 0) {          /* first touch before any move event */
+        mx = W / 2; my = H / 2; dirty = 1;
+    }
+    int b = hit_test();
+    press_btn = b;
+    press_ms = now_ms();
+    if (b >= 0) { sel = b; dirty = 1; }
+}
+static void pointer_up(void) {
+    if (press_btn >= 0) {
+        int b = hit_test();          /* only fire if still over the same box */
+        int id = btns[press_btn].id;
+        int idx = press_btn;
+        press_btn = -1;
+        if (b == idx) activate(id);
+        else dirty = 1;
+    }
+}
+
+static void key_event(int code, int value) {
+    if (value == 2) return;          /* autorepeat: ignore, we move by press */
+    if (value == 0) return;          /* key release */
+    FILE *t = fopen("/dev/ttyS0", "w");
+    if (t) { fprintf(t, "[gui] key %d\n", code); fclose(t); }
+
+    if (nbtn == 0) return;
+    if (sel < 0 || sel >= nbtn) sel = 0;
+
+    switch (code) {
+    case KEY_UP: case KEY_LEFT:
+        sel = (sel + nbtn - 1) % nbtn; dirty = 1; break;
+    case KEY_DOWN: case KEY_RIGHT: case KEY_TAB:
+        sel = (sel + 1) % nbtn; dirty = 1; break;
+    case KEY_ENTER: case KEY_KPENTER: case KEY_SPACE:
+        activate(btns[sel].id); break;
+    case KEY_ESC:
+        if (scr != SCR_MODE) activate(0);
+        break;
+    default:
+        if (code >= KEY_1 && code <= KEY_9) {
+            int n = code - KEY_1;
+            if (n < nbtn) { sel = n; dirty = 1; activate(btns[n].id); }
         }
+        break;
+    }
+}
+
+static void handle_event(Dev *d, struct input_event *ev) {
+    if (ev->type == EV_KEY) {
+        if (ev->code == BTN_LEFT || ev->code == BTN_TOUCH ||
+            ev->code == BTN_TOOL_FINGER || ev->code == BTN_STYLUS) {
+            if (ev->value == 1) pointer_down();
+            else if (ev->value == 0) pointer_up();
+            return;
+        }
+        key_event(ev->code, ev->value);
+    } else if (ev->type == EV_ABS) {
+        if (ev->code == d->xcode)      { d->rx = ev->value; set_abs(d, d->rx, d->ry); }
+        else if (ev->code == d->ycode) { d->ry = ev->value; set_abs(d, d->rx, d->ry); }
+        else if (ev->code == ABS_MT_TRACKING_ID) {
+            /* protocol B panels: a new finger id means touch, -1 means lift */
+            if (ev->value >= 0) { if (!d->has_button) pointer_down(); }
+            else                { if (!d->has_button) pointer_up(); }
+        }
+    } else if (ev->type == EV_REL) {
+        if (mx < 0 || my < 0) { mx = W / 2; my = H / 2; }
+        if (ev->code == REL_X) { mx = clampi(mx + ev->value * 2, 0, W - 1); dirty = 1; }
+        if (ev->code == REL_Y) { my = clampi(my + ev->value * 2, 0, H - 1); dirty = 1; }
+    }
+}
+
+/* ---- stdin fallback: console / serial keyboard in raw mode ------------- */
+static void stdin_setup(void) {
+    if (!isatty(0)) return;
+    struct termios t;
+    if (tcgetattr(0, &t) != 0) return;
+    t.c_lflag &= ~(ICANON | ECHO | ISIG);
+    t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 0;
+    if (tcsetattr(0, TCSANOW, &t) != 0) return;
+    fcntl(0, F_SETFL, fcntl(0, F_GETFL) | O_NONBLOCK);
+    stdin_raw = 1;
+}
+
+static void stdin_bytes(void) {
+    static int esc = 0;
+    unsigned char c;
+    while (read(0, &c, 1) == 1) {
+        if (esc == 1) { esc = (c == '[' || c == 'O') ? 2 : 0; continue; }
+        if (esc == 2) {
+            esc = 0;
+            if (c == 'A') key_event(KEY_UP, 1);
+            else if (c == 'B') key_event(KEY_DOWN, 1);
+            else if (c == 'C') key_event(KEY_RIGHT, 1);
+            else if (c == 'D') key_event(KEY_LEFT, 1);
+            continue;
+        }
+        if (c == 27) { esc = 1; continue; }
+        if (c == '\r' || c == '\n') key_event(KEY_ENTER, 1);
+        else if (c == ' ') key_event(KEY_SPACE, 1);
+        else if (c == '\t') key_event(KEY_TAB, 1);
+        else if (c >= '1' && c <= '9') key_event(KEY_1 + (c - '1'), 1);
+        else if (c == 'q' || c == 'Q') key_event(KEY_ESC, 1);
+    }
+}
+
+static void pump_events(void) {
+    fd_set r;
+    FD_ZERO(&r);
+    int mfd = 0;
+    for (int i = 0; i < ndev; i++) { FD_SET(dv[i].fd, &r); if (dv[i].fd > mfd) mfd = dv[i].fd; }
+    if (stdin_raw && !ev_kbd) { FD_SET(0, &r); }
+    struct timeval tv = { 0, 40000 };      /* 40 ms tick */
+    if (select(mfd + 1, &r, NULL, NULL, &tv) > 0) {
+        for (int i = 0; i < ndev; i++) {
+            if (!FD_ISSET(dv[i].fd, &r)) continue;
+            struct input_event ev;
+            while (read(dv[i].fd, &ev, sizeof ev) == sizeof ev)
+                handle_event(&dv[i], &ev);
+        }
+        if (stdin_raw && !ev_kbd && FD_ISSET(0, &r)) stdin_bytes();
+    }
+    /* panels that report a touch but never a release: commit after 700 ms */
+    if (press_btn >= 0 && now_ms() - press_ms > 700) {
+        int id = btns[press_btn].id;
+        press_btn = -1;
+        activate(id);
     }
 }
 
 /* --------------------------------------------------------------- main */
+
+/* Ask fbdev for the biggest mode the panel advertises; a 1080p/4K display
+ * must not show a small 1024x768 stamp in the corner.  Silently keeps the
+ * current mode if the driver refuses the switch. */
+static void set_best_mode(void) {
+    FILE *f = fopen("/sys/class/graphics/fb0/modes", "r");
+    if (!f) return;
+    char line[80];
+    int bw = 0, bh = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *c = strchr(line, ':');
+        int w = 0, h = 0;
+        if (c && sscanf(c + 1, "%dx%d", &w, &h) == 2) {
+            if (w < 800 || w > 4096 || h < 600 || h > 2400) continue;
+            if ((long)w * h > (long)bw * bh) { bw = w; bh = h; }
+        }
+    }
+    fclose(f);
+    if (bw == 0) return;
+
+    struct fb_var_screeninfo v;
+    if (ioctl(fbfd, FBIOGET_VSCREENINFO, &v)) return;
+    if (bw <= v.xres && bh <= v.yres) return;
+    unsigned int ox = v.xres, oy = v.yres;
+    v.xres = bw; v.yres = bh;
+    v.xres_virtual = bw; v.yres_virtual = bh;
+    v.activate = FB_ACTIVATE_ALL;
+    if (ioctl(fbfd, FBIOPUT_VSCREENINFO, &v)) {
+        v.xres = ox; v.yres = oy;
+        v.xres_virtual = ox; v.yres_virtual = oy;
+        ioctl(fbfd, FBIOPUT_VSCREENINFO, &v);
+        fprintf(stderr, "fb: keeping %ux%u\n", ox, oy);
+    }
+}
 int main(void) {
     fbfd = open("/dev/fb0", O_RDWR);
     if (fbfd < 0) { perror("fb0"); return 1; }
+    set_best_mode();
     struct fb_var_screeninfo v;
     struct fb_fix_screeninfo f;
     if (ioctl(fbfd, FBIOGET_VSCREENINFO, &v) || ioctl(fbfd, FBIOGET_FSCREENINFO, &f)) { perror("ioctl"); return 1; }
     W = v.xres; H = v.yres; BPP = v.bits_per_pixel; ROWL = f.line_length;
     if (BPP != 32 && BPP != 24 && BPP != 16) return 1;
+    if (mx < 0) { mx = W / 2; my = H / 2; }
+    FS = H / 360;                 /* 800p -> 2, 1080p -> 3, 1440p -> 4 */
+    if (FS < 1) FS = 1;
+    if (FS > 4) FS = 4;
     size_t len = (size_t)f.smem_len;
     fb = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
     if (fb == MAP_FAILED) { perror("mmap"); return 1; }
 
     scan_disks();
     open_inputs();
+    stdin_setup();
+    {   /* leave a breadcrumb for debugging from the serial console */
+        FILE *t = fopen("/dev/ttyS0", "w");
+        if (t) { fprintf(t, "[gui] devices=%d stdin_raw=%d fb=%dx%dx%d\n", ndev, stdin_raw, W, H, BPP); fclose(t); }
+    }
     scr = SCR_MODE;
     redraw();
-    for (;;) pump_events();
+    dirty = 0;
+
+    long last_scan = now_ms();
+    for (;;) {
+        pump_events();
+        if (now_ms() - last_scan > 3000) { last_scan = now_ms(); open_inputs(); }
+        if (dirty) { dirty = 0; redraw(); }
+    }
     return 0;
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Nova-Linux 0.9 Aurora - self-contained live/installer ISO
+# Nova-Linux 1.0 Sun - self-contained live/installer ISO
 # Linux 6.8 kernel + BusyBox userland + self-made install wizard (novainstall)
 set -e
 cd /tmp/nlbuild
@@ -109,7 +109,7 @@ fi
 clear
 echo ""
 echo "==============================================================="
-echo "  Nova-Linux 0.9 (Aurora) - live environment"
+echo "  Nova-Linux 1.0 (Sun) - live environment"
 echo "  Linux 6.8.0-31-generic + BusyBox, 100% NovaOS project"
 echo "==============================================================="
 echo "  install to disk : run 'novainstall'"
@@ -133,7 +133,7 @@ cat > $R/rootfs-template/sbin/init <<'EOS'
 clear
 echo ""
 echo "==============================================================="
-echo "  Nova-Linux 0.9 (Aurora) - installed system"
+echo "  Nova-Linux 1.0 (Sun) - installed system"
 echo "  booted from $(cat /proc/cmdline 2>/dev/null | tr ' ' '\n' | grep ^root= || echo disk)"
 echo "==============================================================="
 echo ""
@@ -245,7 +245,7 @@ cat > $R/usr/sbin/novainstall <<'EOS'
 # Nova-Linux install wizard (self-made, no external deps)
 echo ""
 echo "==============================================================="
-echo "  Nova-Linux 0.9 (Aurora) - install wizard"
+echo "  Nova-Linux 1.0 (Sun) - install wizard"
 echo "==============================================================="
 echo ""
 echo "Install modes:"
@@ -329,7 +329,7 @@ EOS
 chmod +x $R/usr/sbin/novainstall
 
 cat > $R/etc/motd <<'EOM'
-Nova-Linux 0.9 (Aurora) - NovaOS project
+Nova-Linux 1.0 (Sun) - NovaOS project
 EOM
 
 # kernel + boot initramfs inside the live system (used by the installer)
@@ -358,8 +358,8 @@ LABEL nova-linux-live
 CFG
 cp vmlinuz iso/boot/
 cp initramfs.gz iso/boot/
-xorriso -as mkisofs -o nova-linux-0.9-aurora.iso -b boot/isolinux/isolinux.bin \
+xorriso -as mkisofs -o nova-linux-1.0-sun.iso -b boot/isolinux/isolinux.bin \
   -c boot/isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table \
   -V NOVA_LINUX iso 2>/dev/null
-ls -la nova-linux-0.9-aurora.iso
+ls -la nova-linux-1.0-sun.iso
 echo "BUILD OK"

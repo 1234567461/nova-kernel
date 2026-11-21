@@ -174,8 +174,12 @@ $(BUILD)/BOOTX64.EFI: $(BUILD)/efi/main.o $(BUILD)/efi/switch.o
 	$(LD) -T $(EFILDS) -shared -Bsymbolic \
 	    -o $(BUILD)/efi/app.so $(EFICRT) $^ $(EFILIBS)
 	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
-	           -j .rel -j .rela -j .reloc \
+	           -j .rel -j .rela -j .rela.dyn -j .reloc \
 	    --target=efi-app-x86_64 $(BUILD)/efi/app.so $@
+	# objcopy does NOT translate ELF .rela.dyn into a PE .reloc table; without
+	# it firmware relocates our image and every GOT slot stays a raw offset
+	# -> #PF (RIP=0) right after the banner.  Patch it in ourselves.
+	python3 tools/efi/pe-reloc.py $(BUILD)/efi/app.so $@
 	@echo "BOOTX64.EFI: $$(stat -c%s $@) bytes"
 
 # 4MB FAT12 image, layout: /EFI/BOOT/BOOTX64.EFI + /EFI/BOOT/KERNEL.BIN
@@ -188,24 +192,38 @@ $(BUILD)/efiboot.img: $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin image
 
 efi: $(BUILD)/efiboot.img
 
-# dual-boot ISO: BIOS boots NOVAOS.IMG (El Torito no-emulation), UEFI boots
-# efiboot.img (El Torito "-e", also no-emulation).  Works with -cdrom on both
-# SeaBIOS and OVMF.
+# dual-boot ISO.
+#
+# BIOS entry: ISOLINUX (El Torito no-emulation, 2KB load + self-reads) which
+#   then loads our floppy image through memdisk.  This is the same boot path
+#   Nova-Linux uses, and it is what every BIOS / VM firmware actually
+#   implements correctly.  The previous layout pointed the El Torito BIOS
+#   entry straight at NOVAOS.IMG, which xorriso turns into *floppy emulation*
+#   (fd1.4); plenty of firmwares (and Android VM apps) cannot read that and
+#   bail out with "Boot failed: Could not read from CDROM (code 0005)".
+#
+# UEFI entry: efiboot.img (El Torito "-e", no-emulation).
 $(BUILD)/iso-src/NOVAOS.IMG: $(BUILD)/novaos.img $(BUILD)/efiboot.img | $(BUILD)
-	mkdir -p $(BUILD)/iso-src/EFI/BOOT
+	mkdir -p $(BUILD)/iso-src/EFI/BOOT $(BUILD)/iso-src/isolinux
 	cp $(BUILD)/novaos.img $(BUILD)/iso-src/NOVAOS.IMG
 	cp $(BUILD)/efiboot.img $(BUILD)/iso-src/efiboot.img
 	cp $(BUILD)/BOOTX64.EFI $(BUILD)/iso-src/EFI/BOOT/BOOTX64.EFI
 	cp $(BUILD)/kernel.bin  $(BUILD)/iso-src/EFI/BOOT/KERNEL.BIN
 	[ -f $(BUILD)/data.img ] && cp $(BUILD)/data.img $(BUILD)/iso-src/DATA.IMG || true
+	cp /usr/lib/ISOLINUX/isolinux.bin $(BUILD)/iso-src/isolinux/
+	cp /usr/lib/syslinux/modules/bios/ldlinux.c32 $(BUILD)/iso-src/isolinux/
+	cp /usr/lib/syslinux/memdisk $(BUILD)/iso-src/isolinux/
+	printf 'DEFAULT novaos\nPROMPT 0\nTIMEOUT 10\nLABEL novaos\n  KERNEL memdisk\n  APPEND initrd=/NOVAOS.IMG\n' \
+	    > $(BUILD)/iso-src/isolinux/isolinux.cfg
 
 iso: $(BUILD)/efiboot.img $(BUILD)/iso-src/NOVAOS.IMG
 	xorriso -as mkisofs -V NOVAOS -R -J \
-	    -b NOVAOS.IMG    -c boot.cat \
+	    -b isolinux/isolinux.bin -c isolinux/boot.cat \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table \
 	    -eltorito-alt-boot \
 	    -e efiboot.img   -no-emul-boot \
 	    -o $(BUILD)/novaos-uefi.iso $(BUILD)/iso-src
-	@echo "==> $(BUILD)/novaos-uefi.iso ready (BIOS + UEFI dual boot)"
+	@echo "==> $(BUILD)/novaos-uefi.iso ready (BIOS isolinux+memdisk / UEFI)"
 
 run-uefi: iso
 	qemu-system-x86_64 -m 64 \

@@ -29,9 +29,25 @@
 
 extern void efi_go32(UINTN kernel_entry, UINTN page_dir);  /* boot/efi/switch.S */
 
+/* Raw COM1 writer: Boot Services (and therefore Print) are gone by the time
+ * we hand over, so keep a tiny serial trace for the mode switch. */
+static void com1(const char *s) {
+    while (*s) {
+        unsigned char c = (unsigned char)*s++;
+        __asm__ __volatile__("outb %0, %1" : : "a"(c), "Nd"((unsigned short)0x3F8));
+    }
+}
+static void com1_hex(UINTN v) {
+    char b[19]; b[0] = '0'; b[1] = 'x';
+    for (int i = 0; i < 16; i++) { int d = (v >> (60 - i * 4)) & 0xF; b[2 + i] = d < 10 ? '0' + d : 'a' + d - 10; }
+    b[18] = 0; com1(b);
+}
+
 EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    com1("[efi] step:libinit\n");
     InitializeLib(ImageHandle, SystemTable);
 
+    com1("[efi] step:banner\n");
     Print(L"NovaOS UEFI loader v0.9\n");
 
     /* ---- locate the boot volume ---- */
@@ -41,11 +57,13 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_FILE *root = NULL, *f = NULL;
 
     st = uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle,
-                           &LoadedImageProtocol, (void **)&li);
+                           com1("[efi] step:loadedimage\n");
+    &LoadedImageProtocol, (void **)&li);
     if (EFI_ERROR(st)) { Print(L"FAIL: LoadedImage (%r)\n", st); return st; }
 
     st = uefi_call_wrapper(BS->HandleProtocol, 3, li->DeviceHandle,
-                           &FileSystemProtocol, (void **)&fs);
+                           com1("[efi] step:fsproto\n");
+    &FileSystemProtocol, (void **)&fs);
     if (EFI_ERROR(st)) {
         /* fallback: first filesystem handle in the system */
         UINTN n = 0; EFI_HANDLE *h = NULL;
@@ -57,16 +75,19 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
         if (EFI_ERROR(st)) return st;
     }
 
-    st = uefi_call_wrapper(fs->OpenVolume, 2, fs, &root);
+    st = com1("[efi] step:openvolume\n");
+    uefi_call_wrapper(fs->OpenVolume, 2, fs, &root);
     if (EFI_ERROR(st)) { Print(L"FAIL: OpenVolume (%r)\n", st); return st; }
 
     /* kernel.bin lives next to BOOTX64.EFI on the boot image */
     st = uefi_call_wrapper(root->Open, 5, root, &f,
                            L"EFI\\BOOT\\KERNEL.BIN",
-                           EFI_FILE_MODE_READ, 0);
+                           com1("[efi] step:openkernel\n");
+    EFI_FILE_MODE_READ, 0);
     if (EFI_ERROR(st)) { Print(L"FAIL: kernel.bin not found (%r)\n", st); return st; }
 
     UINT64 fsize = 0; UINTN sz = sizeof(fsize);
+    com1("[efi] step:fileinfo\n");
     EFI_FILE_INFO *fi = LibFileInfo(f);
     if (fi) { fsize = fi->FileSize; FreePool(fi); }
     if (fsize == 0 || fsize > KERNEL_MAX) {
@@ -78,10 +99,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     /* ---- claim the fixed load address ---- */
     UINTN pages = (fsize + 0xFFF) >> 12;
     st = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAddress,
-                           EfiLoaderData, pages, (EFI_PHYSICAL_ADDRESS)KERNEL_LOAD);
+                           com1("[efi] step:allocpages\n");
+    EfiLoaderData, pages, (EFI_PHYSICAL_ADDRESS)KERNEL_LOAD);
     if (EFI_ERROR(st)) { Print(L"FAIL: 0x100000 not allocatable (%r)\n", st); return st; }
 
     sz = (UINTN)fsize;
+    com1("[efi] step:readkernel\n");
     st = uefi_call_wrapper(f->Read, 3, f, &sz, (void *)KERNEL_LOAD);
     if (EFI_ERROR(st)) { Print(L"FAIL: read kernel (%r)\n", st); return st; }
     uefi_call_wrapper(f->Close, 1, f);
@@ -112,6 +135,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     }
 
     /* ---- boot services are gone: build the stage-2 page tables ---- */
+    com1("[efi] boot services exited, building page tables\n");
     /* identity map 0..4MB: 1024 4KB pages in PT@0xA000, PDE[0] -> PT@0xA000 */
     UINT32 *pt = (UINT32 *)PT_ADDR;
     UINT32 *pd = (UINT32 *)PD_ADDR;
@@ -121,7 +145,23 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     pd[0] = PT_ADDR | 0x3;
 
     /* ---- long mode -> 32-bit protected mode -> kernel ---- */
-    efi_go32((UINTN)KERNEL_LOAD, (UINTN)PD_ADDR);
+    /*  NOTE: this MUST be a direct, PC-relative call.  Compiling a plain
+     *  `efi_go32(...)` here made GCC emit a GOT-indirect call
+     *  (movabs $off,%rax / add %r15,%rax / call *%rax).  Firmware only
+     *  applies the PE .reloc table when it loads the image, and this link
+     *  (objcopy'd -shared, 12-byte .reloc) leaves the GOT slot at 0, so the
+     *  CPU jumped to RIP=0 and OVMF raised #PF 0x0E.  Inline asm with an
+     *  explicit `call efi_go32` turns into R_X86_64_PLT32, which the linker
+     *  resolves directly (the symbol is .hidden in switch.S). */
+    com1("[efi] jumping to kernel ");
+    com1_hex((UINTN)KERNEL_LOAD);
+    com1(" cr3=");
+    com1_hex((UINTN)PD_ADDR);
+    com1("\n");
+    __asm__ __volatile__("call efi_go32"
+                         :
+                         : "D"((UINTN)KERNEL_LOAD), "S"((UINTN)PD_ADDR)
+                         : "memory");
 
     return EFI_SUCCESS;   /* never reached */
 }
