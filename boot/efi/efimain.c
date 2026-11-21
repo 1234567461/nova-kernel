@@ -32,7 +32,7 @@ extern void efi_go32(UINTN kernel_entry, UINTN page_dir);  /* boot/efi/switch.S 
 EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
 
-    Print(L"NovaOS UEFI loader v0.7\n");
+    Print(L"NovaOS UEFI loader v0.9\n");
 
     /* ---- locate the boot volume ---- */
     EFI_STATUS st;

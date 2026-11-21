@@ -154,7 +154,7 @@ buf_seg:      .word 0x0000
 cur_lba_lo:   .word 0x0000
 cur_lba_hi:   .word 0x0000
 
-msg_boot:     .asciz "NovaOS HD boot v0.8\n"
+msg_boot:     .asciz "NovaOS HD boot v0.9\n"
 msg_ok:       .asciz "kernel loaded\n"
 msg_disk_err: .asciz "disk error\n"
 

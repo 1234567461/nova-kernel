@@ -206,7 +206,7 @@ static void win_draw_content(window_t *w) {
 
     switch (w->type) {
     case WIN_ABOUT:
-        gfx_drawstring(cx, cy,      "NovaOS v0.8",        0x04, 0x07);
+        gfx_drawstring(cx, cy,      "NovaOS v0.9",        0x04, 0x07);
         gfx_drawstring(cx, cy + 11, "home-grown kernel",   0x01, 0x07);
         gfx_drawstring(cx, cy + 21, "GDT IDT paging",      0x01, 0x07);
         gfx_drawstring(cx, cy + 31, "ring3 FAT12 mouse",   0x01, 0x07);
