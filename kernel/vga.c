@@ -334,3 +334,173 @@ void gfx_drawstring(int x, int y, const char *s, u8 fg, u8 bg) {
 void gfx_clear(u8 color) {
     memset((void*)VGA_FB, color, GFX_W * GFX_H);
 }
+
+/* ================================================================== */
+/* true colour framebuffer (VBE linear framebuffer)                    */
+/*                                                                    */
+/* The rest of the kernel only ever needed 256 palette indices, which  */
+/* is what forced the old 320x200 mode.  The desktop now draws in      */
+/* real 32bpp colour on whatever mode the loader programmed, so this   */
+/* section adds a small immediate-mode API on top of the same font.    */
+/* ================================================================== */
+#include "vbe.h"
+
+static u32 *fb32 = 0;
+static int  fbw = 0, fbh = 0, fbp = 0;      /* fbp: stride in pixels */
+
+int gfx_hw_init(void) {
+    if (!vbe_init()) { fb32 = 0; return 0; }
+    fb32 = vbe_fb();
+    fbw  = vbe_width();
+    fbh  = vbe_height();
+    fbp  = vbe_pitch_px();
+    if (!fb32 || fbw <= 0 || fbh <= 0) { fb32 = 0; return 0; }
+    return 1;
+}
+
+int gfx_is_vbe(void)    { return fb32 != 0; }
+int gfx_screen_w(void)  { return fb32 ? fbw : GFX_W; }
+int gfx_screen_h(void)  { return fb32 ? fbh : GFX_H; }
+
+void gfx_px(int x, int y, u32 rgb) {
+    if (!fb32) return;
+    if (x < 0 || x >= fbw || y < 0 || y >= fbh) return;
+    fb32[(u32)y * (u32)fbp + (u32)x] = rgb;
+}
+
+static u32 blend(u32 dst, u32 src, int a) {
+    u32 rb = dst & 0x00FF00FFu, g = dst & 0x0000FF00u;
+    u32 sr = src & 0x00FF00FFu, sg = src & 0x0000FF00u;
+    rb = (((sr - rb) * (u32)a) >> 8) + rb;
+    g  = (((sg - g)  * (u32)a) >> 8) + g;
+    return (rb & 0x00FF00FFu) | (g & 0x0000FF00u);
+}
+
+void gfx_rect(int x0, int y0, int x1, int y1, u32 rgb) {
+    if (!fb32) return;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= fbw) x1 = fbw - 1;
+    if (y1 >= fbh) y1 = fbh - 1;
+    if (x0 > x1 || y0 > y1) return;
+    for (int y = y0; y <= y1; y++) {
+        u32 *row = fb32 + (u32)y * (u32)fbp;
+        for (int x = x0; x <= x1; x++) row[x] = rgb;
+    }
+}
+
+void gfx_rect_a(int x0, int y0, int x1, int y1, u32 rgb, int a) {
+    if (!fb32) return;
+    if (a <= 0) return;
+    if (a >= 255) { gfx_rect(x0, y0, x1, y1, rgb); return; }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= fbw) x1 = fbw - 1;
+    if (y1 >= fbh) y1 = fbh - 1;
+    if (x0 > x1 || y0 > y1) return;
+    for (int y = y0; y <= y1; y++) {
+        u32 *row = fb32 + (u32)y * (u32)fbp;
+        for (int x = x0; x <= x1; x++) row[x] = blend(row[x], rgb, a);
+    }
+}
+
+/* horizontal run helper: fills [x0,x1] on row y only for the rounded
+ * span of that row, which keeps the corner cost proportional to r */
+static int isqrt_i(int v) {
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+static void round_rows(int x0, int y0, int x1, int y1, int r,
+                       u32 rgb, int a, int ring_only) {
+    if (!fb32) return;
+    if (r < 0) r = 0;
+    int maxr = (x1 - x0) / 2;
+    if ((y1 - y0) / 2 < maxr) maxr = (y1 - y0) / 2;
+    if (r > maxr) r = maxr;
+
+    for (int y = y0; y <= y1; y++) {
+        int inset = 0;
+        int dy = y - y0;
+        if (dy < r)                inset = r - isqrt_i(r * r - (r - dy) * (r - dy));
+        else if (y1 - y < r)       { int d = y1 - y; inset = r - isqrt_i(r * r - (r - d) * (r - d)); }
+        int lx = x0 + inset, rx = x1 - inset;
+        if (lx > rx) continue;
+
+        if (ring_only) {
+            /* top / bottom rows of the ring and its vertical sides */
+            int edge_row = (y < y0 + 1) || (y > y1 - 1);
+            if (edge_row) {
+                if (a >= 255) { for (int x = lx; x <= rx; x++) gfx_px(x, y, rgb); }
+                else          { for (int x = lx; x <= rx; x++) {
+                                    if (x >= 0 && x < fbw && y >= 0 && y < fbh)
+                                        fb32[(u32)y * fbp + x] = blend(fb32[(u32)y * fbp + x], rgb, a); } }
+            } else {
+                gfx_px(lx, y, rgb);
+                gfx_px(rx, y, rgb);
+            }
+        } else {
+            if (a >= 255) gfx_rect(lx, y, rx, y, rgb);
+            else          gfx_rect_a(lx, y, rx, y, rgb, a);
+        }
+    }
+}
+
+void gfx_round(int x0, int y0, int x1, int y1, int r, u32 rgb) {
+    round_rows(x0, y0, x1, y1, r, rgb, 255, 0);
+}
+void gfx_round_a(int x0, int y0, int x1, int y1, int r, u32 rgb, int a) {
+    round_rows(x0, y0, x1, y1, r, rgb, a, 0);
+}
+void gfx_ring(int x0, int y0, int x1, int y1, int r, u32 rgb) {
+    round_rows(x0, y0, x1, y1, r, rgb, 255, 1);
+}
+
+void gfx_grad(int x0, int y0, int x1, int y1, u32 top, u32 bot) {
+    if (!fb32) return;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= fbw) x1 = fbw - 1;
+    if (y1 >= fbh) y1 = fbh - 1;
+    if (x0 > x1 || y0 > y1) return;
+    int h = y1 - y0;
+    for (int y = y0; y <= y1; y++) {
+        int t = h ? (y - y0) * 255 / h : 0;
+        u32 c = blend(top, bot, t);
+        u32 *row = fb32 + (u32)y * (u32)fbp;
+        for (int x = x0; x <= x1; x++) row[x] = c;
+    }
+}
+
+void gfx_char(int x, int y, char c, u32 fg, int scale) {
+    if (!fb32) return;
+    if (scale < 1) scale = 1;
+    const u8 *glyph = font8x8[(u8)c & 0x7F];
+    for (int row = 0; row < 8; row++) {
+        u8 bits = glyph[row];
+        for (int col = 0; col < 8; col++) {
+            if (!(bits & (1u << col))) continue;
+            int px = x + col * scale, py = y + row * scale;
+            if (scale == 1) { gfx_px(px, py, fg); continue; }
+            gfx_rect(px, py, px + scale - 1, py + scale - 1, fg);
+        }
+    }
+}
+
+void gfx_str(int x, int y, const char *s, u32 fg, int scale) {
+    if (scale < 1) scale = 1;
+    while (*s) {
+        gfx_char(x, y, *s++, fg, scale);
+        x += 8 * scale;
+    }
+}
+
+int gfx_strw(const char *s, int scale) {
+    if (scale < 1) scale = 1;
+    int n = 0;
+    while (s[n]) n++;
+    return n * 8 * scale;
+}
+
+int gfx_strh(int scale) { return 8 * (scale < 1 ? 1 : scale); }

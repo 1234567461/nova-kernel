@@ -1,8 +1,8 @@
-/* NovaOS - VGA display driver
- * Two backends:
- *   1. 80x25 text mode  (0xB8000), used for boot console and shell
- *   2. 320x200x256 mode-13h graphics, used by the built-in GUI
- * The graphics mode is set by writing VGA registers directly (no VBE).
+/* NovaOS - display driver
+ * Backends:
+ *   1. 80x25 text mode (0xB8000) - boot console and shell
+ *   2. VBE 32bpp linear framebuffer - the modern desktop (1024x768+)
+ *   3. 320x200x256 mode 13h - last-resort fallback when no VBE exists
  */
 #ifndef NOVA_VGA_H
 #define NOVA_VGA_H
@@ -26,12 +26,32 @@ int     vga_get_x(void);
 int     vga_get_y(void);
 void    vga_scroll(void);
 
-/* graphics mode */
+/* legacy mode-13h */
 void    vga_set_mode13h(void);
 void    gfx_putpixel(int x, int y, u8 color);
 void    gfx_fillrect(int x0, int y0, int x1, int y1, u8 color);
 void    gfx_drawchar(int x, int y, char c, u8 fg, u8 bg);
 void    gfx_drawstring(int x, int y, const char *s, u8 fg, u8 bg);
 void    gfx_clear(u8 color);
+
+/* ---- true colour (VBE) --------------------------------------------- */
+#define RGB(r,g,b) (((u32)(r) << 16) | ((u32)(g) << 8) | (u32)(b))
+
+int  gfx_hw_init(void);            /* 1 = VBE framebuffer is live */
+int  gfx_is_vbe(void);
+int  gfx_screen_w(void);
+int  gfx_screen_h(void);
+
+void gfx_px(int x, int y, u32 rgb);
+void gfx_rect(int x0, int y0, int x1, int y1, u32 rgb);
+void gfx_rect_a(int x0, int y0, int x1, int y1, u32 rgb, int a);
+void gfx_round(int x0, int y0, int x1, int y1, int r, u32 rgb);
+void gfx_round_a(int x0, int y0, int x1, int y1, int r, u32 rgb, int a);
+void gfx_grad(int x0, int y0, int x1, int y1, u32 top, u32 bot);
+void gfx_ring(int x0, int y0, int x1, int y1, int r, u32 rgb);
+void gfx_char(int x, int y, char c, u32 fg, int scale);
+void gfx_str(int x, int y, const char *s, u32 fg, int scale);
+int  gfx_strw(const char *s, int scale);
+int  gfx_strh(int scale);
 
 #endif

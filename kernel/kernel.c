@@ -116,6 +116,12 @@ void kernel_main(void) {
     paging_init();
     bootlog_ok(NULL);
 
+    bootlog_start("video", "VBE framebuffer");
+    if (gfx_hw_init())
+        bootlog_ok(NULL);
+    else
+        bootlog_fail("no VBE (mode 13h)");
+
     bootlog_start("security", "hardening");
     user_init();
     if (paging_smep_enabled())

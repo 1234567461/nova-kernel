@@ -33,15 +33,24 @@ static u8 mouse_read(void) {
     return inb(0x60);
 }
 
+static int m_max_x = 319, m_max_y = 199, m_scale = 1;
+
+void mouse_set_bounds(int w, int h, int scale) {
+    m_max_x = w > 0 ? w - 1 : 319;
+    m_max_y = h > 0 ? h - 1 : 199;
+    m_scale = scale < 1 ? 1 : scale;
+    if (m_x > m_max_x) m_x = m_max_x;
+    if (m_y > m_max_y) m_y = m_max_y;
+}
 static void mouse_process(void) {
-    int dx = (int)(i8)m_pkt[1];
-    int dy = -(int)(i8)m_pkt[2];           /* screen Y grows down */
+    int dx = (int)(i8)m_pkt[1] * m_scale;
+    int dy = -(int)(i8)m_pkt[2] * m_scale; /* screen Y grows down */
     m_x += dx;
     m_y += dy;
     if (m_x < 0) m_x = 0;
-    if (m_x > 319) m_x = 319;
+    if (m_x > m_max_x) m_x = m_max_x;
     if (m_y < 0) m_y = 0;
-    if (m_y > 199) m_y = 199;
+    if (m_y > m_max_y) m_y = m_max_y;
     m_buttons = (u8)(m_pkt[0] & 0x07);
 }
 

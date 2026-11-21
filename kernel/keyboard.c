@@ -84,6 +84,11 @@ static void keyboard_handler(struct regs *r) {
     else if (sc == 0xAA || sc == 0xB6) shift = 0;    /* shift up */
     else if (sc == 0x3A) caps = !caps;
     else if (sc & 0x80) { /* key release: ignore */ }
+    else if (sc >= 0x3B && sc <= 0x44) {
+        /* F1..F12: reported in a second private range so the desktop can
+         * bind actions (save/open/new) that plain ASCII cannot express */
+        kb_enqueue_u16((u16)(0x200 + (sc - 0x3B + 1)));
+    }
     else if (sc >= 0x47 && sc <= 0x53) {
         /* non-extended codes in the keypad block are the NumLock-on
          * digits and arithmetic (QEMU's sendkey kp_* emits exactly

@@ -5,6 +5,8 @@
 #include "common.h"
 
 void mouse_init(void);
+/* tell the driver the real screen size and the motion scale to use */
+void mouse_set_bounds(int w, int h, int scale);
 int  mouse_pos_x(void);
 int  mouse_pos_y(void);
 int  mouse_left_down(void);

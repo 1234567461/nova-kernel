@@ -19,7 +19,7 @@ CFLAGS  := -m32 -ffreestanding -fno-pie -fno-stack-protector \
 LDFLAGS := -m elf_i386 -T link.ld -nostdlib
 
 # kernel.bin may not exceed 200 sectors (102400 bytes) - matches boot.asm
-KERNEL_MAX := 102400
+KERNEL_MAX := 133120
 
 C_SRCS := kernel/entry.c kernel/gdt.c kernel/idt.c kernel/isr.c kernel/irq.c \
           kernel/timer.c kernel/keyboard.c kernel/mouse.c kernel/vga.c \
@@ -27,7 +27,7 @@ C_SRCS := kernel/entry.c kernel/gdt.c kernel/idt.c kernel/isr.c kernel/irq.c \
           kernel/sched.c kernel/syscall.c kernel/user.c kernel/ata.c \
           kernel/fat.c kernel/gui.c kernel/shell.c kernel/bootlog.c \
           kernel/pci.c kernel/ne2k.c kernel/rtl8139.c kernel/net.c kernel/update.c \
-          kernel/rtc.c kernel/pkg.c kernel/kernel.c \
+          kernel/rtc.c kernel/pkg.c kernel/vbe.c kernel/kernel.c \
           libc/string.c libc/printf.c
 C_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
 ASM_OBJS := $(BUILD)/kernel/isr_stubs.o $(BUILD)/kernel/embed.o
@@ -55,8 +55,8 @@ $(BUILD)/loader.bin: boot/loader.asm | $(BUILD)
 	# Without this, lgdt reads from physical 0x00B8 and the CPU triple
 	# faults the moment it tries to load CS with the bogus GDT.
 	$(LD) -m elf_i386 -Ttext 0x7E00 --oformat binary -o $@ $(BUILD)/loader.o
-	@test $$(stat -c%s $@) -le 1024 || (echo "ERROR: loader.bin > 1024 bytes"; exit 1)
-	@echo "loader.bin: $$(stat -c%s $@) bytes (sectors 1-2)"
+	@test $$(stat -c%s $@) -le 4096 || (echo "ERROR: loader.bin > 4096 bytes"; exit 1)
+	@echo "loader.bin: $$(stat -c%s $@) bytes (sectors 1-8)"
 
 # --- hard-disk stage 1 (written to LBA0 by the `install` wizard) ---------
 $(BUILD)/boothd.bin: boot/boothd.asm | $(BUILD)
@@ -123,7 +123,7 @@ image: $(BUILD)/boot.bin $(BUILD)/loader.bin $(BUILD)/kernel.bin
 	$(DD) if=/dev/zero of=$(BUILD)/novaos.img bs=512 count=2880 status=none
 	$(DD) if=$(BUILD)/boot.bin   of=$(BUILD)/novaos.img conv=notrunc status=none
 	$(DD) if=$(BUILD)/loader.bin of=$(BUILD)/novaos.img bs=512 seek=1 conv=notrunc status=none
-	$(DD) if=$(BUILD)/kernel.bin of=$(BUILD)/novaos.img bs=512 seek=3 conv=notrunc status=none
+	$(DD) if=$(BUILD)/kernel.bin of=$(BUILD)/novaos.img bs=512 seek=9 conv=notrunc status=none
 	@echo "==> $(BUILD)/novaos.img ready"
 
 check: image data

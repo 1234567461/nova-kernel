@@ -33,9 +33,9 @@
     .set SECT_PER_TRACK, 18
     .set HEADS,         2
     .set LOADER_START_SECTOR, 2       # 1-based: loader begins at sector 2
-    .set LOADER_SECTORS,   2          # loader fits in 2 sectors (1024B)
-    .set KERNEL_START_SECTOR, 4       # kernel begins at sector 4
-    .set KERNEL_SECTORS,  200         # 200 * 512 = 102400 bytes max kernel
+    .set LOADER_SECTORS,   8          # loader: VBE setup + pmode (4KB)
+    .set KERNEL_START_SECTOR, 10      # kernel begins at sector 10
+    .set KERNEL_SECTORS,  260         # 260 * 512 = 133120 bytes max kernel
 
 _start:
     cli

@@ -1,34 +1,20 @@
-/* NovaOS - built-in GUI desktop
+/* NovaOS 1.0 "Sun" - modern desktop shell
  *
- * VGA mode 13h (320x200x256) + window manager + taskbar, all home-grown:
- * the framebuffer is the raw linear 0xA0000 region, the widgets are drawn
- * with gfx_* primitives and the mouse/keyboard are read from the drivers
- * directly.
+ * Replaces the old mode-13h (320x200x256) desktop with a true-colour
+ * compositor on top of the VBE linear framebuffer:
  *
- * Fixed in this revision (the old version was mostly non-functional):
- *   - mouse_left_clicked()/mouse_left_released() are edge-detectors that
- *     *consume* the edge by updating m_prev.  The old loop called both on
- *     every iteration for unrelated purposes, so whichever call came first
- *     ate the edge and the other one always saw a stale (false) result.
- *     A plain left-click therefore never focused/dragged a window and the
- *     release was never observed - drag never stopped.  We now snapshot the
- *     edges ONCE per frame and drive the whole UI from that snapshot.
- *   - dragging recomputed nx/ny from the live cursor every frame, so the
- *     window could never actually follow the cursor.  We now latch the
- *     grab offset at the click and move the window by the cursor delta.
- *   - windows opened at hard-coded slots and could overlap arbitrarily;
- *     a click on a background window could not raise it above a later one.
- *     We now cascade placement and raise-on-click.
- *   - Tab-cycle could spin forever when no window was open (focus = -1);
- *     no keyboard focus model existed at all.
- *   - the mode-13h register sequence was missing the palette DAC setup and
- *     used a bogus 0x3C6 value, so the screen came up black.
- *   - the cursor was painted once and never erased; it left a permanent
- *     trail across the desktop.
- *   - the frame loop busy-spun (100% CPU) and never ran hlt().
+ *   - wallpaper with a vertical gradient and soft accent glows
+ *   - top bar with the product name and a live RTC clock
+ *   - floating rounded windows with drop shadows and traffic-light buttons
+ *   - a centred dock with hand-drawn icons
+ *   - a real text editor (open / edit / save on the FAT12 volume)
+ *
+ * Everything is drawn with the immediate-mode gfx_* API in vga.c, so the
+ * whole shell is a few hundred lines of plain C - no toolkit, no libs.
  */
 #include "gui.h"
 #include "vga.h"
+#include "vbe.h"
 #include "keyboard.h"
 #include "mouse.h"
 #include "string.h"
@@ -36,369 +22,160 @@
 #include "serial.h"
 #include "mm.h"
 #include "kheap.h"
-#include "io.h"
 #include "timer.h"
+#include "rtc.h"
 #include "fat.h"
+#include "io.h"
 
-/* scheduler / paging live data shown in the Tasks and System Info windows */
 extern u32 sched_task_count(void);
 extern u32 sched_current_pid(void);
-extern int  paging_smep_enabled(void);
+extern int paging_smep_enabled(void);
 
-#define MAX_WIN   8
-#define TASKBAR_H 12
-#define TITLE_H   12
-#define CASCADE_X 10
-#define CASCADE_Y 14
+/* ------------------------------------------------------------------ */
+/* palette                                                            */
+/* ------------------------------------------------------------------ */
+#define C_BG_TOP   RGB(15, 21, 38)
+#define C_BG_BOT   RGB(7, 10, 18)
+#define C_TOPBAR   RGB(17, 24, 39)
+#define C_DOCK     RGB(23, 32, 50)
+#define C_WIN      RGB(26, 36, 54)
+#define C_WIN2     RGB(32, 44, 66)
+#define C_TITLE    RGB(36, 50, 74)
+#define C_TITLE2   RGB(28, 39, 58)
+#define C_BORDER   RGB(55, 72, 102)
+#define C_TEXT     RGB(233, 238, 247)
+#define C_DIM      RGB(154, 170, 194)
+#define C_MUTED    RGB(106, 124, 150)
+#define C_OK       RGB(34, 197, 94)
+#define C_WARN     RGB(245, 158, 11)
+#define C_ERR      RGB(239, 68, 68)
+#define C_CYAN     RGB(34, 211, 238)
 
-enum { WIN_CONSOLE, WIN_ABOUT, WIN_MEMINFO, WIN_TASKS, WIN_FILES,
-       WIN_SYSINFO, WIN_NOTEPAD, WIN_CALC, WIN_BROWSER };
+static u32 darken(u32 c, int a) {
+    u32 r = ((c >> 16) & 0xFF) * (u32)a / 255;
+    u32 g = ((c >> 8) & 0xFF) * (u32)a / 255;
+    u32 b = (c & 0xFF) * (u32)a / 255;
+    return RGB(r, g, b);
+}
+static u32 accent = RGB(59, 130, 246);
+static u32 accent_dim = RGB(37, 82, 158);
+
+/* ------------------------------------------------------------------ */
+/* layout (scaled from a 1024x768 design)                             */
+/* ------------------------------------------------------------------ */
+static int W, H, SC, SM;
+#define PX(v) ((v) * H / 768)
+#define TOPH  PX(40)
+#define DOCKH PX(74)
+#define RAD   PX(14)
+#define TH    PX(44)
+
+/* ------------------------------------------------------------------ */
+/* windows                                                            */
+/* ------------------------------------------------------------------ */
+#define MAX_WIN 8
+enum { APP_EDITOR = 0, APP_FILES, APP_CONSOLE, APP_CALC,
+       APP_SETTINGS, APP_ABOUT, APP_COUNT };
 
 typedef struct {
-    int  used;
-    int  type;
-    int  x, y, w, h;
-    int  focused;
-    char title[24];
-} window_t;
+    int used, app, x, y, w, h;
+    int min;                    /* minimised */
+} win_t;
 
-static window_t wins[MAX_WIN];
+static win_t wins[MAX_WIN];
 static int focus = -1;
-static int cascade = 0;
 
-/* ---- application state, one instance per app type --------------------- */
-
-#define NP_CAP   512                 /* notepad text buffer */
-static char np_buf[NP_CAP];
-static u32  np_len = 0;
-
-#define CALC_CAP 32
-static char calc_buf[CALC_CAP];      /* expression being typed */
-static u32  calc_len = 0;
-static int  calc_has_result = 0;
-static int  calc_result = 0;
-static char calc_err[20];
-
-#define BR_PAGE_HOME 0
-static int  br_page = BR_PAGE_HOME;  /* 0 home, 1..3 = FAT documents */
-
-#define FILE_ROWS 6
-static char   fl_names[FILE_ROWS][FAT_NAME_LEN];
-static u32    fl_sizes[FILE_ROWS];
-static u32    fl_count = 0;
-static int    fl_valid = 0;          /* refreshed since last open */
-
-static void files_refresh(void) {
-    u32 n = 0;
-    if (fat_mounted() && fat_list(fl_names, fl_sizes, FILE_ROWS, &n))
-        fl_count = n;
-    else
-        fl_count = 0;
-    fl_valid = 1;
-}
-
-/* evaluate the calc expression strictly left-to-right (no precedence):
- * returns 1 on success, 0 on division by zero, -1 on a malformed expr */
-static int calc_eval(const char *s, int *out) {
-    int acc = 0, num = 0, have_num = 0;
-    char op = '+';
-    for (; *s; s++) {
-        if (*s >= '0' && *s <= '9') {
-            num = num * 10 + (*s - '0');
-            have_num = 1;
-        } else if (*s == '+' || *s == '-' || *s == '*' || *s == '/') {
-            if (!have_num) return -1;
-            if (op == '+') acc += num;
-            else if (op == '-') acc -= num;
-            else if (op == '*') acc *= num;
-            else {
-                if (num == 0) return 0;
-                acc /= num;
-            }
-            op = *s;
-            num = 0;
-            have_num = 0;
-        } else {
-            return -1;                 /* anything else is garbage */
-        }
-    }
-    if (!have_num) return -1;
-    if (op == '+') acc += num;
-    else if (op == '-') acc -= num;
-    else if (op == '*') acc *= num;
-    else {
-        if (num == 0) return 0;
-        acc /= num;
-    }
-    *out = acc;
-    return 1;
-}
-
-/* one-frame snapshot of the input edges, so the consuming edge-detectors
- * are each called exactly once per iteration */
-typedef struct {
-    int click, release, down;   /* left-button edge / level */
-    int mx, my;                 /* cursor position */
-} input_t;
-
-static const char *win_title(int type) {
-    switch (type) {
-    case WIN_CONSOLE:  return "Console";
-    case WIN_ABOUT:    return "About NovaOS";
-    case WIN_MEMINFO:  return "Memory Info";
-    case WIN_TASKS:    return "Tasks";
-    case WIN_FILES:    return "Files";
-    case WIN_SYSINFO:  return "System Info";
-    case WIN_NOTEPAD:  return "Notepad";
-    case WIN_CALC:     return "Calculator";
-    case WIN_BROWSER:  return "NovaBrowse";
+static const char *app_title(int a) {
+    switch (a) {
+    case APP_EDITOR:   return "Text Editor";
+    case APP_FILES:    return "Files";
+    case APP_CONSOLE:  return "Console";
+    case APP_CALC:     return "Calculator";
+    case APP_SETTINGS: return "Settings";
+    case APP_ABOUT:    return "About NovaOS";
     }
     return "Window";
 }
 
-/* draw up to maxlines lines of text, wrapping at maxchars columns;
- * returns the y of the next free row */
-static int draw_wrapped(const char *s, int x, int y, int maxchars,
-                        int maxlines, u8 fg) {
-    for (int line = 0; line < maxlines && *s; line++) {
-        int col = 0;
-        while (*s && col < maxchars && *s != '\n')
-            gfx_drawchar(x + col * 8, y + line * 9, *s++, fg, 0x07), col++;
-        if (*s == '\n') s++;
-    }
-    return y + maxlines * 9;
+/* ------------------------------------------------------------------ */
+/* buttons (rebuilt every frame)                                      */
+/* ------------------------------------------------------------------ */
+#define MAXBTN 40
+typedef struct { int x, y, w, h, id; } btn_t;
+static btn_t btns[MAXBTN];
+static int nbtn = 0, sel = -1;
+
+static void btn_add(int x, int y, int w, int h, int id) {
+    if (nbtn >= MAXBTN) return;
+    btns[nbtn].x = x; btns[nbtn].y = y;
+    btns[nbtn].w = w; btns[nbtn].h = h;
+    btns[nbtn].id = id;
+    nbtn++;
+}
+static int btn_hit(int mx, int my) {
+    for (int i = nbtn - 1; i >= 0; i--)
+        if (mx >= btns[i].x && mx < btns[i].x + btns[i].w &&
+            my >= btns[i].y && my < btns[i].y + btns[i].h)
+            return btns[i].id;
+    return -1;
 }
 
-static void win_draw_frame(window_t *w) {
-    u8 title_bg = w->focused ? 0x09 : 0x08;    /* focused = bright blue */
+/* ------------------------------------------------------------------ */
+/* editor state                                                       */
+/* ------------------------------------------------------------------ */
+#define ED_CAP 8000
+static char ed_buf[ED_CAP];
+static int  ed_len = 0, ed_cx = 0, ed_cy = 0, ed_top = 0;
+static int  ed_dirty = 0, ed_pick = 0;
+static char ed_name[16] = "NOTES.TXT";
+static char ed_msg[64] = "";
+static int  ed_text_x = 0, ed_text_y = 0, ed_lh = 0, ed_rows = 0;
+static int  ed_cols = 0;
 
-    /* drop shadow: offset to the bottom-right in the darkest palette
-     * entry, so windows read as layered on the desktop */
-    gfx_fillrect(w->x + 3, w->y + 3, w->x + w->w + 2, w->y + w->h + 2, 0x00);
+/* file picker list */
+#define PK_N 12
+static char pk_names[PK_N][FAT_NAME_LEN];
+static u32  pk_sizes[PK_N];
+static int  pk_n = 0, pk_sel = 0;
 
-    /* body, then title bar, then a raised border */
-    gfx_fillrect(w->x + 1, w->y + 1, w->x + w->w - 2, w->y + w->h - 2, 0x03);
-    /* one-pixel highlight at the top of the focused title bar */
-    if (w->focused)
-        gfx_fillrect(w->x + 1, w->y + 1, w->x + w->w - 2, w->y + 1, 0x0B);
-    gfx_fillrect(w->x + 1, w->y + (w->focused ? 2 : 1),
-                 w->x + w->w - 2, w->y + TITLE_H, title_bg);
-    gfx_fillrect(w->x, w->y, w->x + w->w - 1, w->y, 0x0F);
-    gfx_fillrect(w->x, w->y + w->h - 1, w->x + w->w - 1, w->y + w->h - 1, 0x08);
-    gfx_fillrect(w->x, w->y, w->x, w->y + w->h - 1, 0x0F);
-    gfx_fillrect(w->x + w->w - 1, w->y, w->x + w->w - 1, w->y + w->h - 1, 0x08);
+/* ------------------------------------------------------------------ */
+/* calculator state                                                   */
+/* ------------------------------------------------------------------ */
+static char calc_buf[24];
+static int  calc_len = 0, calc_ok = 0, calc_val = 0;
+static char calc_err[20];
 
-    /* title text (clipped to the bar so long titles cannot bleed out) */
-    int tx = w->x + 4;
-    for (const char *s = w->title; *s && tx < w->x + w->w - 10; s++, tx += 8)
-        gfx_drawchar(tx, w->y + 3, *s, 0x0F, title_bg);
+/* ------------------------------------------------------------------ */
+/* console state                                                      */
+/* ------------------------------------------------------------------ */
+static const char *con_lines[] = {
+    "NovaOS 1.0 (Sun) - home-grown kernel",
+    "",
+    "stage1 -> stage2 -> pmode -> paging -> ring3",
+    "GDT  IDT  paging  COW fork  FAT12  scheduler",
+    "",
+    "This shell is C + GNU as, drawn straight to",
+    "the VBE framebuffer. No libraries involved.",
+    "",
+    "F1  editor    F2 save    F3 open    F4 new",
+    "Esc closes the focused window",
+};
+#define CON_N ((int)(sizeof con_lines / sizeof con_lines[0]))
 
-    /* close box in the top-right corner */
-    int cbx = w->x + w->w - 10;
-    gfx_fillrect(cbx + 1, w->y + 2, cbx + 8, w->y + 9, 0x0C);
-    gfx_drawchar(cbx + 2, w->y + 3, 'x', 0x0F, 0x0C);
+/* ------------------------------------------------------------------ */
+/* helpers                                                            */
+/* ------------------------------------------------------------------ */
+static void text_c(int cx, int y, const char *s, u32 fg, int sc) {
+    gfx_str(cx - gfx_strw(s, sc) / 2, y, s, fg, sc);
 }
 
-static void win_draw_content(window_t *w) {
-    int cx = w->x + 6;
-    int cy = w->y + TITLE_H + 5;
-    char buf[40];
-
-    switch (w->type) {
-    case WIN_ABOUT:
-        gfx_drawstring(cx, cy,      "NovaOS v0.9",        0x04, 0x07);
-        gfx_drawstring(cx, cy + 11, "home-grown kernel",   0x01, 0x07);
-        gfx_drawstring(cx, cy + 21, "GDT IDT paging",      0x01, 0x07);
-        gfx_drawstring(cx, cy + 31, "ring3 FAT12 mouse",   0x01, 0x07);
-        gfx_drawstring(cx, cy + 45, "N notepad K calc B browse",     0x0E, 0x07);
-        gfx_drawstring(cx, cy + 55, "drag: title, close: x/Esc",     0x0E, 0x07);
-        break;
-
-    case WIN_MEMINFO: {
-        u32 free_kb = mm_free_frames() * 4;
-        gfx_drawstring(cx, cy,      "phys free:", 0x01, 0x07);
-        ksprintf(buf, "%u KB", free_kb);
-        gfx_drawstring(cx + 88, cy, buf, 0x04, 0x07);
-        gfx_drawstring(cx, cy + 12, "heap used:", 0x01, 0x07);
-        ksprintf(buf, "%u B", kheap_used());
-        gfx_drawstring(cx + 88, cy + 12, buf, 0x04, 0x07);
-        break;
-    }
-
-    case WIN_TASKS: {
-        u32 n = sched_task_count();
-        ksprintf(buf, "%u task(s)", n);
-        gfx_drawstring(cx, cy, buf, 0x01, 0x07);
-        ksprintf(buf, "current pid %u", sched_current_pid());
-        gfx_drawstring(cx, cy + 12, buf, 0x04, 0x07);
-        ksprintf(buf, "ticks %u", (u32)timer_ticks());
-        gfx_drawstring(cx, cy + 24, buf, 0x01, 0x07);
-        break;
-    }
-
-    case WIN_FILES: {
-        extern int fat_mounted(void);
-        extern u32 fat_free_bytes(void);
-        if (!fat_mounted()) {
-            gfx_drawstring(cx, cy, "no FAT12 volume", 0x0C, 0x07);
-            break;
-        }
-        if (fl_count == 0) {
-            gfx_drawstring(cx, cy, "volume empty", 0x0E, 0x07);
-        } else {
-            for (u32 i = 0; i < fl_count && i < FILE_ROWS; i++) {
-                ksprintf(buf, "%-12s %6u B", fl_names[i], fl_sizes[i]);
-                gfx_drawstring(cx, cy + (int)i * 9, buf, 0x02, 0x07);
-            }
-        }
-        ksprintf(buf, "free %u KB", fat_free_bytes() / 1024);
-        gfx_drawstring(cx, cy + FILE_ROWS * 9 + 4, buf, 0x01, 0x07);
-        break;
-    }
-
-    case WIN_NOTEPAD: {
-        int maxc = (w->w - 14) / 8;
-        int maxl = (w->h - TITLE_H - 18) / 9;
-        draw_wrapped(np_buf, cx, cy, maxc, maxl, 0x01);
-        /* caret: a solid block right after the last character */
-        gfx_drawstring(cx, cy + maxl * 9,
-                       "type here - saved on close", 0x0E, 0x07);
-        break;
-    }
-
-    case WIN_CALC: {
-        gfx_fillrect(w->x + 5, cy, w->x + w->w - 6, cy + 11, 0x0F);
-        u32 elen = calc_len > 18 ? calc_len - 18 : 0;
-        gfx_drawstring(cx, cy + 2, calc_buf + elen, 0x01, 0x0F);
-        if (calc_has_result) {
-            ksprintf(buf, "= %d", calc_result);
-            gfx_drawstring(cx, cy + 16, buf, 0x02, 0x07);
-        } else if (calc_err[0]) {
-            gfx_drawstring(cx, cy + 16, calc_err, 0x0C, 0x07);
-        }
-        gfx_drawstring(cx, cy + 30, "0-9 + - * / =  C clear", 0x0E, 0x07);
-        gfx_drawstring(cx, cy + 40, "left-to-right, no precedence", 0x06, 0x07);
-        break;
-    }
-
-    case WIN_BROWSER: {
-        int maxc = (w->w - 14) / 8;
-        int maxl = (w->h - TITLE_H - 16) / 9;
-        static const char *links[3] =
-            { "1. readme.txt", "2. hello.txt", "3. about" };
-        if (br_page == BR_PAGE_HOME) {
-            gfx_drawstring(cx, cy, "NovaBrowse 0.1", 0x09, 0x07);
-            gfx_drawstring(cx, cy + 11, "the NovaOS web", 0x06, 0x07);
-            for (int i = 0; i < 3; i++)
-                gfx_drawstring(cx, cy + 26 + i * 9, links[i], 0x04, 0x07);
-            gfx_drawstring(cx, cy + 26 + 3 * 9,
-                           "press 1-3 to follow a link", 0x0E, 0x07);
-        } else {
-            const char *addr = (br_page == 3) ? "doc://about"
-                                              : (br_page == 1)
-                                                ? "doc://readme.txt"
-                                                : "doc://hello.txt";
-            gfx_fillrect(w->x + 5, cy, w->x + w->w - 6, cy + 10, 0x08);
-            gfx_drawstring(cx, cy + 1, addr, 0x0F, 0x08);
-            char doc[640];
-            u32 size = 0;
-            if (br_page != 3 && fat_mounted() &&
-                fat_read(br_page == 1 ? "readme.txt" : "hello.txt",
-                         (u8*)doc, sizeof(doc) - 1, &size) && size) {
-                doc[size] = '\0';
-            } else if (br_page == 3) {
-                strncpy(doc,
-                        "NovaBrowse renders text documents from the FAT12 "
-                        "volume. No network stack yet - the real web is a "
-                        "future project.", sizeof(doc) - 1);
-                doc[sizeof(doc) - 1] = '\0';
-            } else {
-                strncpy(doc, "(document not found)", sizeof(doc) - 1);
-                doc[sizeof(doc) - 1] = '\0';
-            }
-            draw_wrapped(doc, cx, cy + 12, maxc, maxl, 0x01);
-        }
-        gfx_drawstring(cx, cy + (w->h - TITLE_H - 13),
-                       br_page == BR_PAGE_HOME ? "H home | 1-3 links"
-                                               : "H home | 1-3 links",
-                       0x0E, 0x07);
-        break;
-    }
-
-    case WIN_SYSINFO: {
-        ksprintf(buf, "up %u.%02u s", (u32)(timer_ticks() / 100),
-                 (u32)(timer_ticks() % 100));
-        gfx_drawstring(cx, cy, buf, 0x01, 0x07);
-        gfx_drawstring(cx, cy + 12, "CR0.WP  on", 0x02, 0x07);
-        if (paging_smep_enabled())
-            gfx_drawstring(cx, cy + 22, "SMEP    on", 0x02, 0x07);
-        else
-            gfx_drawstring(cx, cy + 22, "SMEP    n/a", 0x0E, 0x07);
-        ksprintf(buf, "%u tasks", sched_task_count());
-        gfx_drawstring(cx, cy + 36, buf, 0x01, 0x07);
-        break;
-    }
-
-    case WIN_CONSOLE:
-    default:
-        gfx_drawstring(cx, cy,      "kernel: hello from C",  0x02, 0x07);
-        gfx_drawstring(cx, cy + 12, "boot: loader->pmode",   0x02, 0x07);
-        gfx_drawstring(cx, cy + 24, "user: ring3 process",   0x02, 0x07);
-        gfx_drawstring(cx, cy + 38, "C A M T F Y N K B",     0x0E, 0x07);
-        break;
-    }
-}
-
-static void redraw_all(void) {
-    /* vertical desktop gradient: the DAC ramp programmed in vga.c gives
-     * 48 shades (indices 16..63) from deep blue-grey down to slate - the
-     * old flat teal fill looked like a test pattern */
-    int gh = GFX_H - TASKBAR_H;
-    for (int y = 0; y < gh; y++)
-        gfx_fillrect(0, y, GFX_W - 1, y, 16 + (y * 47) / (gh - 1));
-
-    /* paint unfocused first, focused last, so the focused window is on top */
-    for (int i = 0; i < MAX_WIN; i++) {
-        if (!wins[i].used || i == focus) continue;
-        win_draw_frame(&wins[i]);
-        win_draw_content(&wins[i]);
-    }
-    if (focus >= 0 && wins[focus].used) {
-        win_draw_frame(&wins[focus]);
-        win_draw_content(&wins[focus]);
-    }
-
-    /* taskbar */
-    gfx_fillrect(0, GFX_H - TASKBAR_H, GFX_W - 1, GFX_H - 1, 0x00);
-    gfx_fillrect(0, GFX_H - TASKBAR_H, GFX_W - 1, GFX_H - TASKBAR_H, 0x0B);
-    gfx_drawstring(4, GFX_H - 10, "NovaOS", 0x0A, 0x00);
-    {   /* clock on the right edge: time since boot */
-        u32 t = timer_ticks();
-        char clock[16];
-        ksprintf(clock, "%u:%02u", t / 6000, (t / 100) % 60);
-        gfx_drawstring(GFX_W - 8 * (u32)strlen(clock) - 4, GFX_H - 10,
-                       clock, 0x07, 0x00);
-    }
-    int bx = 60;
-    for (int i = 0; i < MAX_WIN; i++) {
-        if (!wins[i].used) continue;
-        u8 bg = (i == focus) ? 0x09 : 0x08;
-        gfx_fillrect(bx - 2, GFX_H - TASKBAR_H + 1, bx + 42, GFX_H - 2, bg);
-        /* only the first letter of the title fits in the button */
-        gfx_drawchar(bx + 16, GFX_H - 10, wins[i].title[0], 0x0F, bg);
-        bx += 46;
-        if (bx > GFX_W - 50) break;
-    }
-}
-
-/* the window under (x,y); topmost first */
 static int win_at(int x, int y) {
-    if (focus >= 0 && wins[focus].used &&
+    if (focus >= 0 && wins[focus].used && !wins[focus].min &&
         x >= wins[focus].x && x < wins[focus].x + wins[focus].w &&
         y >= wins[focus].y && y < wins[focus].y + wins[focus].h)
         return focus;
     for (int i = MAX_WIN - 1; i >= 0; i--) {
-        if (!wins[i].used) continue;
+        if (!wins[i].used || wins[i].min) continue;
         if (x >= wins[i].x && x < wins[i].x + wins[i].w &&
             y >= wins[i].y && y < wins[i].y + wins[i].h)
             return i;
@@ -406,287 +183,948 @@ static int win_at(int x, int y) {
     return -1;
 }
 
-static int win_at_title(int x, int y) {
-    int i = win_at(x, y);
-    if (i >= 0 && y >= wins[i].y && y <= wins[i].y + TITLE_H) return i;
-    return -1;
+static void win_raise(int i) {
+    if (i < 0 || i >= MAX_WIN || !wins[i].used) return;
+    focus = i;
+    wins[i].min = 0;
 }
 
-static int win_at_close(int x, int y) {
-    for (int i = MAX_WIN - 1; i >= 0; i--) {
-        if (!wins[i].used) continue;
-        int cbx = wins[i].x + wins[i].w - 10;
-        if (x >= cbx + 1 && x <= cbx + 8 &&
-            y >= wins[i].y + 2 && y <= wins[i].y + 9)
-            return i;
+static int win_open(int app) {
+    for (int i = 0; i < MAX_WIN; i++) {
+        if (wins[i].used && wins[i].app == app) { win_raise(i); return i; }
     }
-    return -1;
-}
-
-static void win_raise(int idx) {
-    if (idx < 0 || idx >= MAX_WIN || !wins[idx].used) return;
-    if (focus >= 0 && focus != idx && wins[focus].used) wins[focus].focused = 0;
-    focus = idx;
-    wins[idx].focused = 1;
-}
-
-static int win_open(int type) {
     for (int i = 0; i < MAX_WIN; i++) {
         if (wins[i].used) continue;
-        window_t *w = &wins[i];
+        win_t *w = &wins[i];
         w->used = 1;
-        w->type = type;
-        w->x = CASCADE_X + (cascade % 6) * 16;
-        w->y = CASCADE_Y + (cascade % 6) * 14;
-        cascade++;
-        /* per-app default geometry: the desktop is only 320x200 */
-        switch (type) {
-        case WIN_NOTEPAD: w->w = 212; w->h = 112; break;
-        case WIN_BROWSER: w->w = 224; w->h = 118; break;
-        case WIN_CALC:    w->w = 172; w->h = 86;  break;
-        default:          w->w = 168; w->h = 88;  break;
+        w->app = app;
+        w->min = 0;
+        int n = 0;
+        for (int k = 0; k < MAX_WIN; k++) if (wins[k].used) n++;
+
+        switch (app) {
+        case APP_EDITOR:   w->w = PX(760); w->h = PX(520); break;
+        case APP_FILES:    w->w = PX(560); w->h = PX(430); break;
+        case APP_CONSOLE:  w->w = PX(660); w->h = PX(400); break;
+        case APP_CALC:     w->w = PX(380); w->h = PX(470); break;
+        case APP_SETTINGS: w->w = PX(600); w->h = PX(430); break;
+        default:           w->w = PX(520); w->h = PX(360); break;
         }
-        if (w->x + w->w > GFX_W) w->x = GFX_W - w->w;
-        if (w->y + w->h > GFX_H - TASKBAR_H)
-            w->y = GFX_H - TASKBAR_H - w->h;
-        strncpy(w->title, win_title(type), sizeof(w->title) - 1);
-        w->title[sizeof(w->title) - 1] = '\0';
-        if (type == WIN_FILES) files_refresh();
-        if (type == WIN_NOTEPAD) {          /* resume the last session */
-            u32 size = 0;
-            if (fat_mounted() &&
-                fat_read("notepad.txt", (u8*)np_buf, NP_CAP - 1, &size)) {
-                np_buf[size] = '\0';
-                np_len = size;
-            }
-        }
-        win_raise(i);
+        if (w->w > W - PX(40)) w->w = W - PX(40);
+        if (w->h > H - TOPH - DOCKH - PX(20)) w->h = H - TOPH - DOCKH - PX(20);
+        w->x = PX(60) + (n % 5) * PX(28);
+        w->y = TOPH + PX(34) + (n % 5) * PX(26);
+        if (w->x + w->w > W - PX(20)) w->x = W - PX(20) - w->w;
+        if (w->y + w->h > H - DOCKH - PX(10)) w->y = H - DOCKH - PX(10) - w->h;
+        focus = i;
         return i;
     }
-    return -1;                 /* out of window slots */
+    return -1;
 }
 
-/* persist the notepad contents; called when its window closes */
-static void notepad_save(void) {
-    if (!fat_mounted() || np_len == 0) return;
-    fat_write("notepad.txt", (const u8*)np_buf, np_len);
-}
-
-static void win_close(int idx) {
-    if (idx < 0 || idx >= MAX_WIN || !wins[idx].used) return;
-    if (wins[idx].type == WIN_NOTEPAD) notepad_save();
-    wins[idx].used = 0;
+static void win_close(int i) {
+    if (i < 0 || i >= MAX_WIN) return;
+    wins[i].used = 0;
     focus = -1;
-    for (int i = MAX_WIN - 1; i >= 0; i--)
-        if (wins[i].used) { focus = i; break; }
-    if (focus >= 0) wins[focus].focused = 1;
+    for (int k = MAX_WIN - 1; k >= 0; k--)
+        if (wins[k].used && !wins[k].min) { focus = k; break; }
 }
 
-static void draw_cursor(const input_t *in) {
-    int x = in->mx, y = in->my;
-    /* a small arrow, drawn last so it is always on top */
-    for (int i = 0; i <= 6; i++)   gfx_putpixel(x, y + i, 0x0F);
-    for (int i = 0; i <= 4; i++)   gfx_putpixel(x + i, y + 2 + i, 0x0F);
-    for (int i = 0; i <= 2; i++)   gfx_putpixel(x + i, y + 6 - i, 0x0F);
+/* ------------------------------------------------------------------ */
+/* wallpaper + chrome                                                 */
+/* ------------------------------------------------------------------ */
+static void draw_glow(int cx, int cy, int r, u32 col, int a0) {
+    for (int i = 0; i < 6; i++) {
+        int rr = r - i * (r / 8);
+        gfx_round_a(cx - rr, cy - rr, cx + rr, cy + rr, rr, col, a0 / 6);
+    }
+}
+
+static void wallpaper(void) {
+    gfx_grad(0, 0, W - 1, H - 1, C_BG_TOP, C_BG_BOT);
+    draw_glow(W * 3 / 4, H / 5, PX(240), accent, 42);
+    draw_glow(W / 5, H * 3 / 4, PX(210), RGB(120, 60, 200), 26);
+}
+
+static void topbar(void) {
+    gfx_rect(0, 0, W - 1, TOPH, C_TOPBAR);
+    gfx_rect(0, TOPH, W - 1, TOPH + 1, RGB(40, 54, 78));
+
+    /* logo dot + product name */
+    int cy = TOPH / 2;
+    gfx_round(PX(16), cy - PX(6), PX(16) + PX(12), cy + PX(6), PX(6), accent);
+    gfx_str(PX(36), cy - gfx_strh(SC) / 2, "NovaOS", C_TEXT, SC);
+    gfx_str(PX(36) + gfx_strw("NovaOS", SC) + PX(8),
+            cy - gfx_strh(SM) / 2, "1.0 Sun", C_MUTED, SM);
+
+    /* clock from the CMOS RTC */
+    rtc_time t;
+    char clk[24] = "--:--";
+    char day[32] = "";
+    if (rtc_get(&t)) {
+        ksprintf(clk, "%02u:%02u", (u32)t.hour, (u32)t.min);
+        static const char *mon[] = { "Jan","Feb","Mar","Apr","May","Jun",
+                                     "Jul","Aug","Sep","Oct","Nov","Dec" };
+        const char *mn = (t.mon >= 1 && t.mon <= 12) ? mon[t.mon - 1] : "---";
+        ksprintf(day, "%s %u %u", mn, (u32)t.day, t.year);
+    }
+    int cw = gfx_strw(clk, SC);
+    gfx_str(W - PX(18) - cw, cy - gfx_strh(SC) / 2, clk, C_TEXT, SC);
+    gfx_str(W - PX(18) - cw - PX(14) - gfx_strw(day, SM),
+            cy - gfx_strh(SM) / 2, day, C_MUTED, SM);
+}
+
+/* dock icon kinds */
+enum { IC_EDITOR, IC_FILES, IC_CONSOLE, IC_CALC, IC_SETTINGS, IC_ABOUT };
+
+static void draw_icon(int kind, int cx, int cy, int s, u32 col) {
+    int h = s / 2;
+    switch (kind) {
+    case IC_EDITOR:
+        gfx_round(cx - h, cy - h, cx + h, cy + h, PX(4), col);
+        for (int i = -2; i <= 2; i++)
+            gfx_rect(cx - h + PX(5), cy + i * PX(4), cx + h - PX(5),
+                     cy + i * PX(4), RGB(12, 18, 30));
+        break;
+    case IC_FILES:
+        gfx_round(cx - h, cy - h + PX(3), cx + h - PX(2), cy + h, PX(4), col);
+        gfx_round(cx - h, cy - h, cx - PX(2), cy - h + PX(7), PX(3), col);
+        break;
+    case IC_CONSOLE:
+        gfx_round(cx - h, cy - h, cx + h, cy + h, PX(4), col);
+        gfx_str(cx - h + PX(4), cy - PX(6), ">_", RGB(12, 18, 30), 1);
+        break;
+    case IC_CALC:
+        gfx_round(cx - h, cy - h, cx + h, cy + h, PX(4), col);
+        gfx_rect(cx - h + PX(4), cy - h + PX(4), cx + h - PX(4), cy - h + PX(8),
+                 RGB(12, 18, 30));
+        for (int r = 0; r < 2; r++)
+            for (int c = 0; c < 3; c++)
+                gfx_rect(cx - h + PX(5) + c * PX(6), cy + PX(1) + r * PX(6),
+                         cx - h + PX(8) + c * PX(6), cy + PX(3) + r * PX(6),
+                         RGB(12, 18, 30));
+        break;
+    case IC_SETTINGS: {
+        gfx_round(cx - h, cy - h, cx + h, cy + h, h / 2 + 1, col);
+        gfx_round(cx - PX(4), cy - PX(4), cx + PX(4), cy + PX(4), PX(4),
+                  RGB(14, 20, 34));
+        break;
+    }
+    default:
+        gfx_round(cx - h, cy - h, cx + h, cy + h, h / 2 + 1, col);
+        gfx_str(cx - PX(2), cy - PX(7), "i", RGB(14, 20, 34), 2);
+        break;
+    }
+}
+
+static void dock(void) {
+    int n = APP_COUNT;
+    int isz = PX(46), gap = PX(14);
+    int dw = n * isz + (n + 1) * gap;
+    int dx = (W - dw) / 2;
+    int dy = H - DOCKH + PX(10);
+    int dh = DOCKH - PX(20);
+
+    gfx_round_a(dx, dy + PX(4), dx + dw, dy + dh + PX(4), dh / 2,
+                RGB(0, 0, 0), 70);
+    gfx_round(dx, dy, dx + dw, dy + dh, dh / 2, C_DOCK);
+    gfx_ring(dx, dy, dx + dw, dy + dh, dh / 2, RGB(48, 64, 90));
+
+    int iy = dy + dh / 2;
+    for (int i = 0; i < n; i++) {
+        int ix = dx + gap + isz / 2 + i * (isz + gap);
+        int hover = btn_hit(mouse_pos_x(), mouse_pos_y()) == 900 + i;
+        u32 c = (i == focus && wins[i].used) ? accent
+                                             : RGB(70, 92, 126);
+        if (hover) c = (c == accent) ? RGB(96, 165, 250) : RGB(92, 116, 156);
+        draw_icon(i, ix, iy, isz, c);
+        btn_add(ix - isz / 2, iy - isz / 2, isz, isz, 900 + i);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* window frame                                                       */
+/* ------------------------------------------------------------------ */
+static void win_frame(win_t *w, int focused) {
+    int x = w->x, y = w->y, ww = w->w, hh = w->h;
+
+    /* layered shadow */
+    for (int i = PX(8); i >= PX(2); i -= PX(2))
+        gfx_round_a(x - i, y - i + PX(6), x + ww + i, y + hh + i + PX(6),
+                    RAD + i, RGB(0, 0, 0), 18);
+
+    gfx_round(x, y, x + ww, y + hh, RAD, C_WIN);
+    gfx_ring(x, y, x + ww, y + hh, RAD, focused ? accent_dim : RGB(44, 58, 82));
+
+    /* title bar: rounded top, square bottom */
+    u32 tb = focused ? C_TITLE : C_TITLE2;
+    gfx_round(x + 1, y + 1, x + ww - 1, y + TH + RAD, RAD, tb);
+    gfx_rect(x + 1, y + RAD, x + ww - 1, y + TH, tb);
+    gfx_rect(x + 1, y + TH, x + ww - 1, y + TH + 1,
+             focused ? accent : RGB(44, 58, 82));
+
+    /* traffic lights */
+    int cy = y + TH / 2, r = PX(7);
+    gfx_round(x + PX(16) - r, cy - r, x + PX(16) + r, cy + r, r, C_ERR);
+    gfx_round(x + PX(38) - r, cy - r, x + PX(38) + r, cy + r, r, C_WARN);
+    gfx_round(x + PX(60) - r, cy - r, x + PX(60) + r, cy + r, r, C_OK);
+
+    gfx_str(x + PX(82), cy - gfx_strh(SC) / 2, app_title(w->app),
+            focused ? C_TEXT : C_DIM, SC);
+}
+
+/* ------------------------------------------------------------------ */
+/* editor                                                             */
+/* ------------------------------------------------------------------ */
+static int ed_lines(void) {
+    int n = 1;
+    for (int i = 0; i < ed_len; i++) if (ed_buf[i] == '\n') n++;
+    return n;
+}
+static int ed_line_off(int line) {
+    int n = 0, off = 0;
+    for (int i = 0; i < ed_len; i++) {
+        if (n == line) return off;
+        if (ed_buf[i] == '\n') { n++; off = i + 1; }
+    }
+    return ed_len;
+}
+static int ed_line_len(int line) {
+    int o = ed_line_off(line), e = o;
+    while (e < ed_len && ed_buf[e] != '\n') e++;
+    return e - o;
+}
+static int ed_index(void) { return ed_line_off(ed_cy) + ed_cx; }
+
+static void ed_clamp_cx(void) {
+    int l = ed_line_len(ed_cy);
+    if (ed_cx > l) ed_cx = l;
+    if (ed_cx < 0) ed_cx = 0;
+}
+
+static void ed_insert(char c) {
+    if (ed_len >= ED_CAP - 1) return;
+    int idx = ed_index();
+    for (int i = ed_len; i > idx; i--) ed_buf[i] = ed_buf[i - 1];
+    ed_buf[idx] = c;
+    ed_len++;
+    if (c == '\n') { ed_cy++; ed_cx = 0; }
+    else ed_cx++;
+    ed_dirty = 1;
+    ed_msg[0] = '\0';
+}
+
+static void ed_backspace(void) {
+    if (ed_len == 0) return;
+    if (ed_cx == 0 && ed_cy == 0) return;
+    int idx = ed_index();
+    if (ed_cx == 0) {                       /* join with the previous line */
+        int prev = ed_line_len(ed_cy - 1);
+        for (int i = idx; i < ed_len; i++) ed_buf[i - 1] = ed_buf[i];
+        ed_len--;
+        ed_cy--;
+        ed_cx = prev;
+    } else {
+        for (int i = idx; i < ed_len; i++) ed_buf[i - 1] = ed_buf[i];
+        ed_len--;
+        ed_cx--;
+    }
+    ed_dirty = 1;
+    ed_msg[0] = '\0';
+}
+
+static void ed_delete(void) {
+    if (ed_len == 0) return;
+    int idx = ed_index();
+    if (idx >= ed_len) return;
+    for (int i = idx; i < ed_len; i++) ed_buf[i] = ed_buf[i + 1];
+    ed_len--;
+    ed_dirty = 1;
+    ed_msg[0] = '\0';
+}
+
+static void ed_save(void) {
+    if (!fat_mounted()) {
+        strncpy(ed_msg, "no FAT volume", sizeof ed_msg - 1);
+        ed_msg[sizeof ed_msg - 1] = '\0';
+        return;
+    }
+    if (fat_write(ed_name, (const u8*)ed_buf, (u32)ed_len)) {
+        ed_dirty = 0;
+        strncpy(ed_msg, "saved", sizeof ed_msg - 1);
+        ed_msg[sizeof ed_msg - 1] = '\0';
+    } else {
+        strncpy(ed_msg, "save failed", sizeof ed_msg - 1);
+        ed_msg[sizeof ed_msg - 1] = '\0';
+    }
+}
+
+static void ed_load(const char *name) {
+    u32 size = 0;
+    if (!fat_mounted()) return;
+    if (fat_read(name, (u8*)ed_buf, ED_CAP - 1, &size)) {
+        ed_len = (int)size;
+        ed_buf[ed_len] = '\0';
+        strncpy(ed_name, name, sizeof ed_name - 1);
+        ed_name[sizeof ed_name - 1] = '\0';
+        ed_cx = ed_cy = ed_top = 0;
+        ed_dirty = 0;
+        ed_pick = 0;
+        strncpy(ed_msg, "opened", sizeof ed_msg - 1);
+        ed_msg[sizeof ed_msg - 1] = '\0';
+    }
+}
+
+static void ed_new(void) {
+    ed_len = 0;
+    ed_cx = ed_cy = ed_top = 0;
+    ed_dirty = 0;
+    ed_pick = 0;
+    strncpy(ed_name, "NOTES.TXT", sizeof ed_name - 1);
+    ed_name[sizeof ed_name - 1] = '\0';
+    strncpy(ed_msg, "new file", sizeof ed_msg - 1);
+    ed_msg[sizeof ed_msg - 1] = '\0';
+}
+
+static void ed_refresh_picker(void) {
+    u32 n = 0;
+    pk_n = 0;
+    if (fat_mounted() && fat_list(pk_names, pk_sizes, PK_N, &n))
+        pk_n = (int)n;
+    pk_sel = 0;
+}
+
+static void draw_editor(win_t *w) {
+    int cx = w->x + PX(18);
+    int cy = w->y + TH + PX(14);
+    int cw = w->w - PX(36);
+    int chh = w->h - TH - PX(48);
+    char line[96];
+
+    /* toolbar */
+    int bh = PX(30);
+    const char *labels[3] = { "Save F2", "Open F3", "New F4" };
+    int ids[3] = { 100, 101, 102 };
+    int bx = cx;
+    for (int i = 0; i < 3; i++) {
+        int bw = gfx_strw(labels[i], SM) + PX(26);
+        gfx_round(bx, cy, bx + bw, cy + bh, PX(7), C_WIN2);
+        gfx_ring(bx, cy, bx + bw, cy + bh, PX(7), RGB(58, 76, 104));
+        gfx_str(bx + PX(13), cy + (bh - gfx_strh(SM)) / 2, labels[i], C_TEXT, SM);
+        btn_add(bx, cy, bw, bh, ids[i]);
+        bx += bw + PX(10);
+    }
+    /* file name on the right of the toolbar */
+    {
+        char nm[40];
+        ksprintf(nm, "%s%s", ed_name, ed_dirty ? " *" : "");
+        int nw = gfx_strw(nm, SM);
+        gfx_str(cx + cw - nw, cy + (bh - gfx_strh(SM)) / 2, nm,
+                ed_dirty ? C_WARN : C_DIM, SM);
+    }
+
+    int ty = cy + bh + PX(12);
+    int th = cy + chh - ty;
+
+    if (ed_pick) {
+        /* ---- file picker ---- */
+        gfx_round(cx, ty, cx + cw, ty + th, PX(9), RGB(20, 28, 44));
+        gfx_ring(cx, ty, cx + cw, ty + th, PX(9), RGB(48, 64, 90));
+        gfx_str(cx + PX(14), ty + PX(12), "Open a file from the FAT volume",
+                C_DIM, SM);
+        if (pk_n == 0) {
+            gfx_str(cx + PX(14), ty + PX(40), "volume empty or not mounted",
+                    C_MUTED, SC);
+        }
+        int rh = PX(34);
+        for (int i = 0; i < pk_n && i < 8; i++) {
+            int ry = ty + PX(38) + i * rh;
+            if (ry + rh > ty + th) break;
+            int on = (i == pk_sel);
+            if (on) gfx_round(cx + PX(10), ry, cx + cw - PX(10), ry + rh - PX(4),
+                              PX(7), accent_dim);
+            ksprintf(line, "%-14s  %u B", pk_names[i], pk_sizes[i]);
+            gfx_str(cx + PX(22), ry + PX(8), line, on ? C_TEXT : C_DIM, SM);
+            btn_add(cx + PX(10), ry, cw - PX(20), rh - PX(4), 200 + i);
+        }
+        return;
+    }
+
+    /* ---- text area ---- */
+    gfx_round(cx, ty, cx + cw, ty + th, PX(9), RGB(18, 25, 40));
+    gfx_ring(cx, ty, cx + cw, ty + th, PX(9), RGB(46, 62, 88));
+
+    int gutter = PX(44);
+    ed_text_x = cx + gutter + PX(10);
+    ed_text_y = ty + PX(12);
+    ed_lh = gfx_strh(SC) + PX(6);
+    ed_rows = th > PX(20) ? (th - PX(22)) / ed_lh : 0;
+    ed_cols = (cw - gutter - PX(20)) / (8 * SC);
+    if (ed_cols < 1) ed_cols = 1;
+
+    /* keep the cursor visible */
+    if (ed_cy < ed_top) ed_top = ed_cy;
+    if (ed_cy >= ed_top + ed_rows) ed_top = ed_cy - ed_rows + 1;
+    if (ed_top < 0) ed_top = 0;
+
+    int total = ed_lines();
+    for (int r = 0; r < ed_rows; r++) {
+        int ln = ed_top + r;
+        if (ln >= total) break;
+        int y = ed_text_y + r * ed_lh;
+        ksprintf(line, "%3d", ln + 1);
+        gfx_str(cx + PX(10), y, line, RGB(72, 88, 112), SM);
+
+        int off = ed_line_off(ln), len = ed_line_len(ln);
+        if (len > ed_cols) len = ed_cols;
+        for (int c = 0; c < len; c++) {
+            char ch = ed_buf[off + c];
+            if (ch < 32) ch = ' ';
+            gfx_char(ed_text_x + c * 8 * SC, y, ch, C_TEXT, SC);
+        }
+        if (ln == ed_cy && ((timer_ticks() / 40) & 1)) {
+            int cxp = ed_text_x + ed_cx * 8 * SC;
+            gfx_rect(cxp, y, cxp + 8 * SC - 1, y + gfx_strh(SC), accent);
+        }
+    }
+
+    /* status bar */
+    {
+        char st[80];
+        int total_lines = ed_lines();
+        ksprintf(st, "Ln %d, Col %d   %d lines   %d chars%s",
+                 ed_cy + 1, ed_cx + 1, total_lines, ed_len,
+                 ed_msg[0] ? "   " : "");
+        int sy = w->y + w->h - PX(34);
+        gfx_str(cx, sy, st, C_MUTED, SM);
+        if (ed_msg[0]) {
+            gfx_str(cx + gfx_strw(st, SM) + PX(6), sy,
+                    ed_msg, C_OK, SM);
+        }
+    }
+}
+
+static void editor_click(win_t *w, int mx, int my) {
+    if (ed_pick) return;                     /* picker uses button ids */
+    int cx = w->x + PX(18);
+    int cy = w->y + TH + PX(14);
+    int cw = w->w - PX(36);
+    int bh = PX(30);
+    int ty = cy + bh + PX(12);
+    int th = cy + (w->h - TH - PX(48)) - ty;
+
+    if (mx < ed_text_x || my < ed_text_y) return;
+    if (mx > cx + cw || my > ty + th) return;
+
+    int row = (my - ed_text_y) / ed_lh;
+    int col = (mx - ed_text_x) / (8 * SC);
+    int line = ed_top + row;
+    if (line < 0) line = 0;
+    if (line >= ed_lines()) line = ed_lines() - 1;
+    ed_cy = line;
+    ed_cx = col;
+    ed_clamp_cx();
+}
+
+/* ------------------------------------------------------------------ */
+/* files                                                              */
+/* ------------------------------------------------------------------ */
+#define FL_N 10
+static char fl_names[FL_N][FAT_NAME_LEN];
+static u32  fl_sizes[FL_N];
+static int  fl_n = -1;
+
+static void files_refresh(void) {
+    u32 n = 0;
+    fl_n = 0;
+    if (fat_mounted() && fat_list(fl_names, fl_sizes, FL_N, &n))
+        fl_n = (int)n;
+}
+
+static void draw_files(win_t *w) {
+    int cx = w->x + PX(20);
+    int cy = w->y + TH + PX(18);
+    int cw = w->w - PX(40);
+    char line[96];
+
+    if (fl_n < 0) files_refresh();
+
+    if (!fat_mounted()) {
+        gfx_str(cx, cy, "No FAT12 volume attached.", C_WARN, SC);
+        gfx_str(cx, cy + PX(26), "Attach data.img as the second disk.", C_MUTED, SM);
+        return;
+    }
+    if (fl_n == 0) {
+        gfx_str(cx, cy, "Volume is empty.", C_DIM, SC);
+    }
+    int rh = PX(42);
+    for (int i = 0; i < fl_n && i < 8; i++) {
+        int ry = cy + i * (rh + PX(6));
+        if (ry + rh > w->y + w->h - PX(50)) break;
+        gfx_round(cx, ry, cx + cw, ry + rh, PX(8), C_WIN2);
+        gfx_round(cx + PX(10), ry + PX(11), cx + PX(26), ry + rh - PX(8),
+                  PX(4), accent_dim);
+        gfx_str(cx + PX(36), ry + PX(9), fl_names[i], C_TEXT, SM);
+        ksprintf(line, "%u bytes", fl_sizes[i]);
+        gfx_str(cx + PX(36), ry + PX(24), line, C_MUTED, SM);
+        btn_add(cx, ry, cw, rh, 300 + i);
+    }
+    ksprintf(line, "free %u KB", fat_free_bytes() / 1024);
+    gfx_str(cx, w->y + w->h - PX(34), line, C_MUTED, SM);
+}
+
+/* ------------------------------------------------------------------ */
+/* console                                                            */
+/* ------------------------------------------------------------------ */
+static void draw_console(win_t *w) {
+    int cx = w->x + PX(20);
+    int cy = w->y + TH + PX(16);
+    for (int i = 0; i < CON_N; i++) {
+        u32 c = (i == 0) ? accent : ((i == 2) ? C_DIM : C_TEXT);
+        gfx_str(cx, cy + i * (gfx_strh(SM) + PX(7)), con_lines[i], c, SM);
+    }
+    char st[96];
+    ksprintf(st, "%u tasks   pid %u   uptime %u s   %ux%ux32",
+             sched_task_count(), sched_current_pid(),
+             (u32)(timer_ticks() / 100), (u32)W, (u32)H);
+    gfx_str(cx, w->y + w->h - PX(34), st, C_MUTED, SM);
+}
+
+/* ------------------------------------------------------------------ */
+/* calculator                                                         */
+/* ------------------------------------------------------------------ */
+static int calc_eval(const char *s, int *out) {
+    int acc = 0, num = 0, have = 0;
+    char op = '+';
+    for (; *s; s++) {
+        if (*s >= '0' && *s <= '9') { num = num * 10 + (*s - '0'); have = 1; }
+        else if (*s == '+' || *s == '-' || *s == '*' || *s == '/') {
+            if (!have) return -1;
+            if (op == '+') acc += num;
+            else if (op == '-') acc -= num;
+            else if (op == '*') acc *= num;
+            else { if (!num) return 0; acc /= num; }
+            op = *s; num = 0; have = 0;
+        } else return -1;
+    }
+    if (!have) return -1;
+    if (op == '+') acc += num;
+    else if (op == '-') acc -= num;
+    else if (op == '*') acc *= num;
+    else { if (!num) return 0; acc /= num; }
+    *out = acc;
+    return 1;
+}
+
+static void draw_calc(win_t *w) {
+    int cx = w->x + PX(20);
+    int cw = w->w - PX(40);
+    int cy = w->y + TH + PX(18);
+    char buf[40];
+
+    gfx_round(cx, cy, cx + cw, cy + PX(64), PX(10), RGB(16, 23, 37));
+    gfx_ring(cx, cy, cx + cw, cy + PX(64), PX(10), RGB(48, 64, 90));
+    int elen = calc_len > 16 ? calc_len - 16 : 0;
+    int ew = gfx_strw(calc_buf + elen, SC);
+    gfx_str(cx + cw - PX(14) - ew, cy + PX(12), calc_buf + elen, C_TEXT, SC);
+    if (calc_ok) {
+        ksprintf(buf, "= %d", calc_val);
+        int rw = gfx_strw(buf, SC);
+        gfx_str(cx + cw - PX(14) - rw, cy + PX(36), buf, C_OK, SC);
+    } else if (calc_err[0]) {
+        gfx_str(cx + PX(14), cy + PX(36), calc_err, C_ERR, SM);
+    }
+
+    static const char *keys[16] = {
+        "7","8","9","/", "4","5","6","*", "1","2","3","-", "0",".","=","+"
+    };
+    int top = cy + PX(78);
+    int gw = (cw - PX(3) * PX(8)) / 4;
+    int gh = PX(52);
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            int x = cx + c * (gw + PX(8));
+            int y = top + r * (gh + PX(8));
+            const char *k = keys[r * 4 + c];
+            int isop = (k[0] == '/' || k[0] == '*' || k[0] == '-' ||
+                        k[0] == '+' || k[0] == '=');
+            gfx_round(x, y, x + gw, y + gh, PX(8),
+                      isop ? accent_dim : C_WIN2);
+            text_c(x + gw / 2, y + (gh - gfx_strh(SC)) / 2, k, C_TEXT, SC);
+            btn_add(x, y, gw, gh, 400 + r * 4 + c);
+        }
+    }
+    gfx_str(cx, w->y + w->h - PX(34), "C clears   Enter evaluates", C_MUTED, SM);
+}
+
+/* ------------------------------------------------------------------ */
+/* settings / about                                                   */
+/* ------------------------------------------------------------------ */
+static void draw_settings(win_t *w) {
+    int cx = w->x + PX(24);
+    int cy = w->y + TH + PX(22);
+    char buf[96];
+
+    gfx_str(cx, cy, "Display", accent, SC);
+    ksprintf(buf, "%d x %d @ 32bpp   VBE linear framebuffer", W, H);
+    gfx_str(cx, cy + PX(26), buf, C_TEXT, SM);
+    gfx_str(cx, cy + PX(46), "The mode is programmed by the stage-2 loader", C_MUTED, SM);
+
+    gfx_str(cx, cy + PX(84), "Accent colour", accent, SC);
+    const char *names[3] = { "Blue", "Sunset", "Mint" };
+    u32 cols[3] = { RGB(59,130,246), RGB(233,84,32), RGB(16,185,129) };
+    int bx = cx;
+    for (int i = 0; i < 3; i++) {
+        int bw = gfx_strw(names[i], SM) + PX(52);
+        int on = (accent == cols[i]);
+        gfx_round(bx, cy + PX(108), bx + bw, cy + PX(108) + PX(40), PX(9),
+                  on ? cols[i] : C_WIN2);
+        gfx_round(bx + PX(12), cy + PX(108) + PX(14),
+                  bx + PX(12) + PX(12), cy + PX(108) + PX(26), PX(6), cols[i]);
+        gfx_str(bx + PX(34), cy + PX(108) + PX(16), names[i],
+                on ? RGB(12,18,30) : C_DIM, SM);
+        btn_add(bx, cy + PX(108), bw, PX(40), 500 + i);
+        bx += bw + PX(12);
+    }
+
+    gfx_str(cx, cy + PX(180), "Kernel", accent, SC);
+    gfx_str(cx, cy + PX(206), "NovaOS 1.0 (Sun) - C + GNU as, no libraries",
+            C_TEXT, SM);
+    ksprintf(buf, "heap %u B   free frames %u   tasks %u",
+             kheap_used(), mm_free_frames(), sched_task_count());
+    gfx_str(cx, cy + PX(226), buf, C_MUTED, SM);
+}
+
+static void draw_about(win_t *w) {
+    int cx = w->x + w->w / 2;
+    int cy = w->y + TH + PX(30);
+
+    gfx_round(cx - PX(34), cy, cx + PX(34), cy + PX(68), PX(18), accent);
+    gfx_str(cx - PX(12), cy + PX(22), "N", RGB(12, 18, 30), 5);
+
+    text_c(cx, cy + PX(88), "NovaOS 1.0 Sun", C_TEXT, SC + 1);
+    text_c(cx, cy + PX(88) + PX(30), "a home-grown operating system", C_DIM, SM);
+    text_c(cx, cy + PX(88) + PX(52),
+           "boot sector / kernel / GUI written from scratch", C_MUTED, SM);
+    text_c(cx, cy + PX(88) + PX(84), "F1 editor   F2 save   F3 open   F4 new",
+           C_WARN, SM);
+    text_c(cx, cy + PX(88) + PX(104), "Esc closes a window   Tab cycles focus",
+           C_MUTED, SM);
+}
+
+/* ------------------------------------------------------------------ */
+/* render                                                             */
+/* ------------------------------------------------------------------ */
+static void render_app(win_t *w) {
+    switch (w->app) {
+    case APP_EDITOR:   draw_editor(w);   break;
+    case APP_FILES:    draw_files(w);    break;
+    case APP_CONSOLE:  draw_console(w);  break;
+    case APP_CALC:     draw_calc(w);     break;
+    case APP_SETTINGS: draw_settings(w); break;
+    default:           draw_about(w);    break;
+    }
+}
+
+static void render_all(void) {
+    nbtn = 0;
+    wallpaper();
+
+    for (int i = 0; i < MAX_WIN; i++) {
+        if (!wins[i].used || wins[i].min || i == focus) continue;
+        win_frame(&wins[i], 0);
+        render_app(&wins[i]);
+    }
+    if (focus >= 0 && wins[focus].used && !wins[focus].min) {
+        win_frame(&wins[focus], 1);
+        render_app(&wins[focus]);
+    }
+
+    dock();
+    topbar();
+}
+
+/* ------------------------------------------------------------------ */
+/* cursor with a saved background so moving it does not repaint all   */
+/* ------------------------------------------------------------------ */
+#define CUR_W 12
+#define CUR_H 18
+static u32 cur_bak[CUR_H][CUR_W];
+static int cur_x = -100, cur_y = -100, cur_valid = 0;
+
+static void cursor_restore(void) {
+    if (!cur_valid) return;
+    u32 *fb = vbe_fb();
+    int p = vbe_pitch_px();
+    for (int r = 0; r < CUR_H; r++) {
+        int y = cur_y + r;
+        if (y < 0 || y >= H) continue;
+        for (int c = 0; c < CUR_W; c++) {
+            int x = cur_x + c;
+            if (x < 0 || x >= W) continue;
+            fb[(u32)y * p + x] = cur_bak[r][c];
+        }
+    }
+    cur_valid = 0;
+}
+
+static void cursor_draw(int x, int y) {
+    u32 *fb = vbe_fb();
+    int p = vbe_pitch_px();
+    /* save */
+    for (int r = 0; r < CUR_H; r++) {
+        int yy = y + r;
+        for (int c = 0; c < CUR_W; c++) {
+            int xx = x + c;
+            cur_bak[r][c] = (yy >= 0 && yy < H && xx >= 0 && xx < W)
+                          ? fb[(u32)yy * p + xx] : 0;
+        }
+    }
+    cur_x = x; cur_y = y; cur_valid = 1;
+
+    /* arrow: white body, dark outline */
+    static const char *shape[CUR_H] = {
+        "X           ",
+        "XX          ",
+        "X.X         ",
+        "X..X        ",
+        "X...X       ",
+        "X....X      ",
+        "X.....X     ",
+        "X......X    ",
+        "X.......X   ",
+        "X........X  ",
+        "X.....XXXXX ",
+        "X..X..X     ",
+        "X.X X..X    ",
+        "XX  X..X    ",
+        "X    X..X   ",
+        "     X..X   ",
+        "      XX    ",
+        "            ",
+    };
+    for (int r = 0; r < CUR_H; r++) {
+        for (int c = 0; c < CUR_W; c++) {
+            char ch = shape[r][c];
+            if (ch == ' ') continue;
+            gfx_px(x + c, y + r, ch == 'X' ? RGB(10, 14, 22) : RGB(248, 250, 253));
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* input handling                                                     */
+/* ------------------------------------------------------------------ */
+static void editor_key(int c) {
+    if (ed_pick) {
+        if (c == 0x148) { if (pk_sel > 0) pk_sel--; }
+        else if (c == 0x150) { if (pk_sel < pk_n - 1) pk_sel++; }
+        else if (c == '\n' || c == '\r') {
+            if (pk_n > 0) ed_load(pk_names[pk_sel]);
+        }
+        else if (c == 27) ed_pick = 0;
+        return;
+    }
+
+    switch (c) {
+    case 0x148: if (ed_cy > 0) { ed_cy--; ed_clamp_cx(); } break;         /* up */
+    case 0x150: if (ed_cy + 1 < ed_lines()) { ed_cy++; ed_clamp_cx(); } break;
+    case 0x14B: if (ed_cx > 0) ed_cx--; else if (ed_cy > 0) {
+                    ed_cy--; ed_cx = ed_line_len(ed_cy); } break;         /* left */
+    case 0x14D: if (ed_cx < ed_line_len(ed_cy)) ed_cx++; else if (ed_cy + 1 < ed_lines()) {
+                    ed_cy++; ed_cx = 0; } break;                          /* right */
+    case 0x147: ed_cx = 0; break;                                        /* home */
+    case 0x14F: ed_cx = ed_line_len(ed_cy); break;                       /* end */
+    case 0x153: ed_delete(); break;                                      /* del */
+    case 0x202: ed_save(); break;                                        /* F2 */
+    case 0x203: ed_refresh_picker(); ed_pick = 1; break;                 /* F3 */
+    case 0x204: ed_new(); break;                                         /* F4 */
+    case '\b': case 127: ed_backspace(); break;
+    case '\n': case '\r': ed_insert('\n'); break;
+    case '\t': for (int i = 0; i < 4; i++) ed_insert(' '); break;
+    default:
+        if (c >= 32 && c < 127) ed_insert((char)c);
+        break;
+    }
+}
+
+static void calc_key(int c) {
+    if (c == '=' || c == '\r' || c == '\n') {
+        int r, rc = calc_eval(calc_buf, &r);
+        if (rc == 1) { calc_val = r; calc_ok = 1; calc_err[0] = '\0'; }
+        else { calc_ok = 0; strncpy(calc_err, rc == 0 ? "division by zero"
+                                                      : "syntax error",
+                                    sizeof calc_err - 1);
+               calc_err[sizeof calc_err - 1] = '\0'; }
+    } else if (c == 'c' || c == 'C' || c == 27) {
+        calc_len = 0; calc_buf[0] = '\0'; calc_ok = 0; calc_err[0] = '\0';
+    } else if (c == '\b' || c == 127) {
+        if (calc_len) calc_buf[--calc_len] = '\0';
+        calc_ok = 0; calc_err[0] = '\0';
+    } else if ((c >= '0' && c <= '9') || c == '+' || c == '-' ||
+               c == '*' || c == '/') {
+        if (calc_len < (int)sizeof calc_buf - 1) {
+            calc_buf[calc_len++] = (char)c;
+            calc_buf[calc_len] = '\0';
+        }
+        calc_ok = 0; calc_err[0] = '\0';
+    }
 }
 
 void gui_enter(void) {
-    input_t in;
-    int drag = -1, drag_dx = 0, drag_dy = 0;
-    int last_mx = -1, last_my = -1;
-    int need_redraw = 1;
+    if (!gfx_is_vbe()) {
+        /* no VBE: keep the shell usable instead of scribbling mode 13h */
+        serial_puts("[gui] no VBE framebuffer - staying in text mode\n");
+        gfx_clear(0);
+        return;
+    }
+    W = gfx_screen_w();
+    H = gfx_screen_h();
+    SC = 2;
+    SM = 1;
+    if (H >= 1080) SC = 2;
+    if (H >= 1600) SC = 3;
 
-    vga_set_mode13h();
+    /* the mouse driver still clamped to 320x200: give it the real size and
+     * a motion multiplier so the pointer can cross a 1024px screen */
+    mouse_set_bounds(W, H, W / 320 > 1 ? W / 320 : 1);
 
     for (int i = 0; i < MAX_WIN; i++) wins[i].used = 0;
     focus = -1;
-    cascade = 0;
 
-    win_open(WIN_CONSOLE);
-    win_open(WIN_BROWSER);
-    win_open(WIN_FILES);
-    win_open(WIN_NOTEPAD);
+    /* a fresh session starts with the editor and the file browser open -
+     * that is what people expect to see on a desktop */
+    ed_refresh_picker();
+    win_open(APP_EDITOR);
+    win_open(APP_FILES);
 
-    serial_puts("[gui] mode 13h desktop up (320x200x256), windows=4\n");
+    render_all();
+    cursor_draw(mouse_pos_x(), mouse_pos_y());
+
+    serial_puts("[gui] NovaOS 1.0 desktop up\n");
+
+    int drag = -1, drag_dx = 0, drag_dy = 0;
+    int need_full = 0;
+    int last_mx = -1, last_my = -1;
 
     for (;;) {
-        /* ---- snapshot the consuming edge-detectors exactly once ---- */
-        in.click   = mouse_left_clicked();
-        in.release = mouse_left_released();
-        in.down    = mouse_left_down();
-        in.mx      = mouse_pos_x();
-        in.my      = mouse_pos_y();
+        int click = mouse_left_clicked();
+        int rel   = mouse_left_released();
+        int down  = mouse_left_down();
+        int mx    = mouse_pos_x();
+        int my    = mouse_pos_y();
 
-        /* ---- mouse: click to focus / raise / start drag ---- */
-        if (in.click) {
-            int c = win_at_close(in.mx, in.my);
-            if (c >= 0) {
-                win_close(c);
-                need_redraw = 1;
-                drag = -1;
-            } else if (in.my >= GFX_H - TASKBAR_H) {
-                /* taskbar buttons: focus the matching window.  The buttons
-                 * used to be pure decoration - clicking them did nothing. */
-                int bx = 60;
-                for (int i = 0; i < MAX_WIN && bx <= GFX_W - 50; i++) {
-                    if (!wins[i].used) continue;
-                    if (in.mx >= bx - 2 && in.mx <= bx + 42) {
-                        win_raise(i);
-                        need_redraw = 1;
-                        break;
-                    }
-                    bx += 46;
+        /* ---- keyboard (drain a few per frame) ---- */
+        int key, nk = 0;
+        while ((key = keyboard_getc()) != 0 && nk < 8) {
+            nk++;
+            if (key == 0x201) {                       /* F1: editor */
+                win_open(APP_EDITOR); need_full = 1; continue;
+            }
+            if (key == 27) {                          /* Esc closes */
+                if (focus >= 0) { win_close(focus); need_full = 1; }
+                continue;
+            }
+            if (focus < 0) continue;
+            switch (wins[focus].app) {
+            case APP_EDITOR: editor_key(key); break;
+            case APP_CALC:   calc_key(key);   break;
+            default: break;
+            }
+            need_full = 1;
+        }
+
+        /* ---- mouse ---- */
+        if (click) {
+            int id = btn_hit(mx, my);
+            if (id == -1 && my < TOPH) {
+                /* top bar: nothing to do yet */
+            } else if (id >= 900 && id < 900 + APP_COUNT) {
+                win_open(id - 900);
+                need_full = 1;
+            } else if (id >= 100 && id < 110 && focus >= 0 &&
+                       wins[focus].app == APP_EDITOR) {
+                if (id == 100) ed_save();
+                else if (id == 101) { ed_refresh_picker(); ed_pick = 1; }
+                else if (id == 102) ed_new();
+                need_full = 1;
+            } else if (id >= 200 && id < 220 && focus >= 0 &&
+                       wins[focus].app == APP_EDITOR) {
+                int i = id - 200;
+                if (i < pk_n) ed_load(pk_names[i]);
+                need_full = 1;
+            } else if (id >= 300 && id < 320 && focus >= 0 &&
+                       wins[focus].app == APP_FILES) {
+                int i = id - 300;
+                if (i < fl_n) {
+                    ed_load(fl_names[i]);
+                    win_open(APP_EDITOR);
                 }
+                need_full = 1;
+            } else if (id >= 400 && id < 420 && focus >= 0 &&
+                       wins[focus].app == APP_CALC) {
+                static const char *keys[16] = {
+                    "7","8","9","/", "4","5","6","*", "1","2","3","-",
+                    "0",".","=","+"
+                };
+                calc_key(keys[id - 400][0]);
+                need_full = 1;
+            } else if (id >= 500 && id < 510 && focus >= 0 &&
+                       wins[focus].app == APP_SETTINGS) {
+                u32 cols[3] = { RGB(59,130,246), RGB(233,84,32), RGB(16,185,129) };
+                accent = cols[id - 500];
+                accent_dim = darken(accent, 150);
+                need_full = 1;
             } else {
-                int w = win_at_title(in.mx, in.my);
-                if (w >= 0) {
-                    win_raise(w);
-                    /* latch the grab offset: the old code recomputed the
-                     * window position from the live cursor each frame,
-                     * which made dragging a no-op */
-                    drag = w;
-                    drag_dx = in.mx - wins[w].x;
-                    drag_dy = in.my - wins[w].y;
-                    need_redraw = 1;
+                int wi = win_at(mx, my);
+                if (wi >= 0) {
+                    win_raise(wi);
+                    /* traffic-light close */
+                    int cy = wins[wi].y + TH / 2, r = PX(9);
+                    if (mx >= wins[wi].x + PX(16) - r && mx <= wins[wi].x + PX(16) + r &&
+                        my >= cy - r && my <= cy + r) {
+                        win_close(wi);
+                        need_full = 1;
+                    } else if (my <= wins[wi].y + TH) {
+                        drag = wi;
+                        drag_dx = mx - wins[wi].x;
+                        drag_dy = my - wins[wi].y;
+                    } else if (wins[wi].app == APP_EDITOR) {
+                        editor_click(&wins[wi], mx, my);
+                    } else if (wins[wi].app == APP_FILES) {
+                        files_refresh();
+                    }
+                    need_full = 1;
                 }
             }
         }
-        if (in.release) drag = -1;
+        if (rel) drag = -1;
 
-        if (drag >= 0 && in.down) {
-            int nx = in.mx - drag_dx;
-            int ny = in.my - drag_dy;
-            if (nx < 0) nx = 0;
-            if (ny < 0) ny = 0;
-            if (nx + wins[drag].w > GFX_W)         nx = GFX_W - wins[drag].w;
-            if (ny + wins[drag].h > GFX_H - TASKBAR_H)
-                ny = GFX_H - TASKBAR_H - wins[drag].h;
+        if (drag >= 0 && down) {
+            int nx = mx - drag_dx, ny = my - drag_dy;
+            if (nx < -wins[drag].w / 2) nx = -wins[drag].w / 2;
+            if (ny < TOPH) ny = TOPH;
+            if (nx > W - PX(80)) nx = W - PX(80);
+            if (ny > H - DOCKH - PX(30)) ny = H - DOCKH - PX(30);
             if (nx != wins[drag].x || ny != wins[drag].y) {
                 wins[drag].x = nx;
                 wins[drag].y = ny;
-                need_redraw = 1;
+                need_full = 1;
             }
         }
 
-        /* ---- keyboard ----
-         * Editable apps (notepad / calculator / browser) swallow normal
-         * keys while focused; global hotkeys apply only when no editable
-         * window has focus.  Esc always closes, Enter still leaves the
-         * desktop unless an editable window needs the key. */
-        int c = keyboard_getc();
-        int editing = (focus >= 0 &&
-                       (wins[focus].type == WIN_NOTEPAD ||
-                        wins[focus].type == WIN_CALC ||
-                        wins[focus].type == WIN_BROWSER));
-        if (c) {
-            if (c == 27) {                                   /* Esc */
-                if (focus >= 0) win_close(focus);
-                need_redraw = 1;
-            } else if (editing && c != '\t') {
-                switch (wins[focus].type) {
-                case WIN_NOTEPAD:
-                    if (c == '\b' || c == 127) {             /* backspace */
-                        if (np_len) np_buf[--np_len] = '\0';
-                    } else if (c == '\n' || c == '\r') {
-                        if (np_len < NP_CAP - 2) {
-                            np_buf[np_len++] = '\n';
-                            np_buf[np_len] = '\0';
-                        }
-                    } else if (c >= 32 && c < 127 &&
-                               np_len < NP_CAP - 1) {
-                        np_buf[np_len++] = (char)c;
-                        np_buf[np_len] = '\0';
-                    }
-                    break;
-                case WIN_CALC:
-                    if (c == '\b' || c == 127) {
-                        if (calc_len) calc_buf[--calc_len] = '\0';
-                        calc_has_result = 0;
-                        calc_err[0] = '\0';
-                    } else if (c == '=' || c == '\r' || c == '\n') {
-                        int r;
-                        int rc = calc_eval(calc_buf, &r);
-                        if (rc == 1) {
-                            calc_result = r;
-                            calc_has_result = 1;
-                            calc_err[0] = '\0';
-                        } else {
-                            calc_has_result = 0;
-                            strncpy(calc_err, rc == 0 ? "div by zero"
-                                      : "syntax error",
-                                      sizeof(calc_err) - 1);
-                            calc_err[sizeof(calc_err) - 1] = '\0';
-                        }
-                    } else if (c == 'c' || c == 'C') {
-                        calc_len = 0;
-                        calc_buf[0] = '\0';
-                        calc_has_result = 0;
-                        calc_err[0] = '\0';
-                    } else if ((c >= '0' && c <= '9') ||
-                               c == '+' || c == '-' || c == '*' ||
-                               c == '/') {
-                        if (calc_len < CALC_CAP - 1) {
-                            calc_buf[calc_len++] = (char)c;
-                            calc_buf[calc_len] = '\0';
-                        }
-                        calc_has_result = 0;
-                        calc_err[0] = '\0';
-                    }
-                    break;
-                case WIN_BROWSER:
-                    if (c >= '1' && c <= '3')
-                        br_page = c - '0';
-                    else if (c == 'h' || c == 'H')
-                        br_page = BR_PAGE_HOME;
-                    break;
-                }
-                need_redraw = 1;
-            } else if (c == 0x0D || c == 0x0A) {             /* Enter: leave GUI */
-                break;
-            } else switch (c) {
-            case 'c': case 'C': win_open(WIN_CONSOLE);  need_redraw = 1; break;
-            case 'a': case 'A': win_open(WIN_ABOUT);    need_redraw = 1; break;
-            case 'm': case 'M': win_open(WIN_MEMINFO);  need_redraw = 1; break;
-            case 't': case 'T': win_open(WIN_TASKS);    need_redraw = 1; break;
-            case 'f': case 'F': win_open(WIN_FILES);    need_redraw = 1; break;
-            case 'y': case 'Y': win_open(WIN_SYSINFO);  need_redraw = 1; break;
-            case 'n': case 'N': win_open(WIN_NOTEPAD);  need_redraw = 1; break;
-            case 'k': case 'K': win_open(WIN_CALC);     need_redraw = 1; break;
-            case 'b': case 'B': win_open(WIN_BROWSER);  need_redraw = 1; break;
-            case '\t': {                                     /* cycle focus */
-                int open = 0;
-                for (int i = 0; i < MAX_WIN; i++) if (wins[i].used) open++;
-                if (open > 0) {
-                    /* the old loop spun forever when nothing was open,
-                     * because focus started at -1 */
-                    int i = focus;
-                    for (int k = 0; k < MAX_WIN; k++) {
-                        i = (i + 1) % MAX_WIN;
-                        if (wins[i].used) break;
-                    }
-                    win_raise(i);
-                    need_redraw = 1;
-                }
-                break;
-            }
-            default: break;
-            }
+        if (need_full) {
+            cursor_restore();
+            render_all();
+            cursor_draw(mx, my);
+            need_full = 0;
+            last_mx = mx; last_my = my;
+        } else if (mx != last_mx || my != last_my) {
+            cursor_restore();
+            cursor_draw(mx, my);
+            last_mx = mx; last_my = my;
         }
 
-        /* ---- repaint only when something moved ---- */
-        if (!need_redraw && (in.mx != last_mx || in.my != last_my)) {
-            need_redraw = 1;             /* cursor moved: must erase old pos */
-        }
-        if (need_redraw) {
-            redraw_all();
-            need_redraw = 0;
-        }
-        draw_cursor(&in);
-        last_mx = in.mx;
-        last_my = in.my;
-
-        hlt();   /* the old loop busy-spun at 100% CPU */
+        hlt();
     }
-
-    serial_puts("[gui] leaving desktop\n");
 }
