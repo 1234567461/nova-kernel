@@ -21,6 +21,9 @@
 #include "net.h"
 #include "ne2k.h"
 #include "update.h"
+#include "ata.h"
+#include "rtc.h"
+#include "printf.h"
 #include "string.h"
 #include "printf.h"
 
@@ -133,6 +136,15 @@ void kernel_main(void) {
         bootlog_ok(note);
     } else {
         bootlog_fail("mount failed");
+    }
+
+    bootlog_start("rtc", "CMOS clock");
+    {
+        char ts[56];
+        if (rtc_str(ts, sizeof(ts)))
+            bootlog_ok(ts);
+        else
+            bootlog_fail("clock not set");
     }
 
     bootlog_start("net", "auto-detect");

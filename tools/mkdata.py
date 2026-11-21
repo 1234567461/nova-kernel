@@ -40,6 +40,7 @@ def main() -> None:
     files.append(("README  TXT", b"NovaOS data disk - FAT12\n"
                                  b"Files: HELLO.ELF (ring3 demo program)\n"
                                  b"       HELLO.TXT, README.TXT\n"))
+    elf_payloads = {"hello": elf_data}
     for p in extra:
         with open(p, "rb") as f:
             data = f.read()
@@ -50,6 +51,18 @@ def main() -> None:
             name8 = (base.split(".")[0][:8] + "       ")[:8]
             ext = (base.split(".")[1][:3] + "   ")[:3]
         files.append((name8 + ext, data))
+        elf_payloads[base.split(".")[0].lower()] = data
+
+    # --- NovaPkg repo: catalog + payload copies -------------------------
+    # The `pkg` command reads REPO.LST and installs PK<name>.ELF payloads
+    # into <name>.ELF.  Everything is plain FAT files - no external tool.
+    files.append(("REPO    LST",
+                  b"hello 0.8.0 ring-3 demo: greets, forks, COW write\n"
+                  b"writer 0.8.0 ring-3 demo: creates and verifies log.txt\n"
+                  b"leaky 0.8.0 ring-3 demo: exit-time fd flush test\n"))
+    for pkg, data in elf_payloads.items():
+        short = "PK" + pkg.upper()[:6]
+        files.append(((short + "       ")[:8] + "ELF", data))
 
     root_sectors = (ROOT_ENTRIES * 32 + BYTES - 1) // BYTES
     data_lba = RESERVED + NUM_FATS * FAT_SIZE + root_sectors

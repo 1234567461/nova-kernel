@@ -153,7 +153,14 @@ void vga_putc(char c, u8 attr) {
         tx++;
     }
     if (tx >= VGA_WIDTH) { tx = 0; ty++; }
-    if (ty >= VGA_HEIGHT) vga_scroll_once();
+    if (ty >= VGA_HEIGHT) {
+        vga_scroll_once();
+        /* CRITICAL: clamp the row back into the screen.  Without this the
+         * cursor keeps pointing past the last row and every following
+         * character writes outside text memory - long output (help text!)
+         * looked like the screen had been wiped. */
+        ty = VGA_HEIGHT - 1;
+    }
     vga_set_cursor(tx, ty);
 }
 

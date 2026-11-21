@@ -12,7 +12,7 @@
  * A bundle is plain text:
  *
  *   NOVA-UPD 1
- *   version=0.7.0
+ *   version=0.8.0
  *   channel=stable
  *   feature=...
  *   note=...
@@ -36,7 +36,7 @@ extern u32 timer_ticks(void);
 static u8  bundle[UPD_MAX + 64];
 static u32 bundle_len;
 
-static char cur_version[16] = "0.7";
+static char cur_version[16] = "0.8";
 static char cur_channel[16] = "building";
 static char cur_source[24] = "factory";
 static char notes[320];

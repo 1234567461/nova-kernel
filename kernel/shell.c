@@ -30,6 +30,8 @@
 #include "net.h"
 #include "ne2k.h"
 #include "update.h"
+#include "rtc.h"
+#include "pkg.h"
 
 #define LINE_MAX   128
 #define ARGV_MAX   16
@@ -147,6 +149,12 @@ static void cmd_help(void) {
         "  run <prog>        load a program from disk and run it in ring 3\n"
         "  echo <text>       print the arguments back\n"
         "  uptime            ticks since boot\n"
+        "  date              the machine's real time (CMOS RTC)\n"
+        "  pkg list|avail    NovaPkg: installed packages / repo catalog\n"
+        "  pkg info <name>   package details from REPO.LST\n"
+        "  pkg install <n>   install a package from the repo\n"
+        "  pkg remove <n>    uninstall a package\n"
+        "  install           guided install: make this disk bootable\n"
         "  net               link status, MAC, IPv4, frame counters\n"
         "  ping [ip]         three ICMP echoes (default: the gateway)\n"
         "  update            fetch + verify + install an update bundle\n"
@@ -203,6 +211,179 @@ static void cmd_uptime(void) {
     ksprintf(buf, "up %u ticks (%u.%02u s at 100 Hz)\n",
              t, t / 100, t % 100);
     puts(buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* date / time - the machine's real clock (CMOS RTC)                  */
+/* ------------------------------------------------------------------ */
+
+static void cmd_date(void) {
+    char buf[80];
+    if (rtc_str(buf, sizeof(buf))) { puts(buf); con_write("\n", 0x0F); }
+    else
+        err("date: RTC reports invalid values (firmware clock not set?)\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* pkg - NovaPkg, the self-made package manager                       */
+/* ------------------------------------------------------------------ */
+
+static void pkg_emit_line(const char *line) { puts(line); con_write("\n", 0x0F); }
+static void pkg_emit_pair(const char *name, const char *ver) {
+    char buf[80];
+    ksprintf(buf, "  %-10s %s\n", name, ver);
+    puts(buf);
+}
+
+static void cmd_pkg(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[1], "list") == 0) {
+        if (!fat_mounted()) { err("pkg: data disk not mounted\n"); return; }
+        con_write("installed packages (PKG.DB):\n", 0x0F);
+        if (!pkg_list_installed(pkg_emit_pair))
+            con_write("  (none - try 'pkg avail' then 'pkg install <name>')\n", 0x07);
+        return;
+    }
+    if (strcmp(argv[1], "avail") == 0) {
+        if (!fat_mounted()) { err("pkg: data disk not mounted\n"); return; }
+        con_write("packages in REPO.LST:\n", 0x0F);
+        if (!pkg_avail(pkg_emit_line))
+            err("pkg: REPO.LST not found\n");
+        return;
+    }
+    if (strcmp(argv[1], "info") == 0) {
+        if (argc < 3) { err("usage: pkg info <name>\n"); return; }
+        static char out[128];
+        if (!pkg_info(argv[2], out, sizeof(out)))
+            err("pkg: no such package in REPO.LST\n");
+        else { puts(out); con_write("\n", 0x0F); }
+        return;
+    }
+    if (strcmp(argv[1], "install") == 0) {
+        if (argc < 3) { err("usage: pkg install <name>\n"); return; }
+        static char out[128];
+        if (pkg_info(argv[2], out, sizeof(out))) {
+            puts(out);
+        }
+        int rc = pkg_install(argv[2]);
+        switch (rc) {
+        case 0:  ok("installed - run it with 'run "); con_write(argv[2], 0x0F);
+                 con_write("'\n", 0x0F); break;
+        case -1: err("pkg: not in REPO.LST\n"); break;
+        case -2: err("pkg: payload missing from the repo\n"); break;
+        case -3: err("pkg: payload too large\n"); break;
+        default: err("pkg: disk write failed\n"); break;
+        }
+        return;
+    }
+    if (strcmp(argv[1], "remove") == 0) {
+        if (argc < 3) { err("usage: pkg remove <name>\n"); return; }
+        if (pkg_remove(argv[2]) == 0)
+            ok("removed\n");
+        else
+            err("pkg: not installed\n");
+        return;
+    }
+    err("usage: pkg [list|avail|info|install|remove] [name]\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* install - guided installation to the IDE disk                      */
+/*                                                                    */
+/* Writes a hard-disk boot sector (AH=42h LBA reads, BPB preserved so  */
+/* the FAT volume stays mounted), stage2 and the kernel to the tail   */
+/* sectors of the data disk.  After `reboot`, BIOS boots from disk    */
+/* with no floppy attached.                                           */
+/* ------------------------------------------------------------------ */
+
+extern char boothd_bin[], boothd_bin_end[];
+extern char loader_bin[], loader_bin_end[];
+extern char end[];                     /* linker: end of kernel image    */
+extern char __bss_start[];             /* linker: file/BSS boundary      */
+
+#define HD_LOADER_LBA   2676
+#define HD_KERNEL_LBA   2678
+#define HD_KERNEL_MAX   200                 /* sectors, matches stage2   */
+
+static int wr_sector_ck(u32 lba, const u8 *buf) {
+    if (!ata_write_sector(lba, buf)) return 0;
+    static u8 rb[512];
+    if (!ata_read_sector(lba, rb)) return 0;
+    for (u32 i = 0; i < 512; i++)
+        if (rb[i] != buf[i]) return 0;
+    return 1;
+}
+
+static void cmd_install(void) {
+    if (!fat_mounted()) { err("install: data disk not mounted\n"); return; }
+
+    con_write("NovaOS install wizard\n", 0x0F);
+    con_write("  writes the boot chain + kernel to the IDE disk:\n"
+              "    LBA    0      hd boot sector (BPB preserved)\n"
+              "    LBA 2676-2677  stage2 loader\n"
+              "    LBA 2678+      kernel image\n"
+              "  The FAT filesystem stays usable.\n", 0x07);
+    con_write("proceed? y/n: ", 0x0E);
+
+    /* read one keystroke (keyboard or serial, like the main loop) */
+    char c = 0;
+    for (;;) {
+        int k = keyboard_getc();
+        if (!k) k = serial_getc();
+        if (k < 0) continue;
+        if (!k) continue;
+        c = (char)k;
+        break;
+    }
+    con_putc(c);
+    con_write("\n", 0x0F);
+    if (c != 'y' && c != 'Y') { ok("cancelled\n"); return; }
+
+    /* 1) hd boot sector: boothd.bin with the disk's own BPB patched in */
+    static u8 s0[512], disk0[512];
+    if (!ata_read_sector(0, disk0)) { err("install: cannot read LBA0\n"); return; }
+    for (u32 i = 0; i < 512; i++) s0[i] = 0;
+    u32 blen = (u32)(boothd_bin_end - boothd_bin);
+    if (blen != 512) { err("install: boothd.bin wrong size\n"); return; }
+    for (u32 i = 0; i < 512; i++) s0[i] = boothd_bin[i];
+    for (u32 i = 3; i < 62; i++) s0[i] = disk0[i];        /* keep BPB  */
+
+    if (!wr_sector_ck(0, s0)) { err("install: LBA0 verify failed\n"); return; }
+    ok("  [ok] hd boot sector written + verified\n");
+
+    /* 2) stage2 loader (2 sectors) */
+    for (u32 s = 0; s < 2; s++) {
+        static u8 sec[512];
+        for (u32 i = 0; i < 512; i++) sec[i] = 0;
+        u32 off = s * 512;
+        u32 avail = (u32)(loader_bin_end - loader_bin) - off;
+        if (avail > 512) avail = 512;
+        for (u32 i = 0; i < avail; i++) sec[i] = loader_bin[off + i];
+        if (!wr_sector_ck(HD_LOADER_LBA + s, sec)) {
+            err("install: loader verify failed\n"); return;
+        }
+    }
+    ok("  [ok] stage2 loader written + verified\n");
+
+    /* 3) kernel image straight from RAM (0x100000..bss start).  Only the
+     * file portion is copied - .bss is zeroed by entry.c at boot, so it
+     * must not count toward the 200-sector stage2 limit. */
+    u32 ksize = (u32)(__bss_start - (char *)0x100000);
+    if (ksize > HD_KERNEL_MAX * 512) { err("install: kernel too large\n"); return; }
+    for (u32 s = 0; s < HD_KERNEL_MAX; s++) {
+        static u8 sec[512];
+        u32 off = s * 512;
+        for (u32 i = 0; i < 512; i++)
+            sec[i] = (off + i) < ksize ? ((char *)0x100000)[off + i] : 0;
+        if (!wr_sector_ck(HD_KERNEL_LBA + s, sec)) {
+            err("install: kernel verify failed\n"); return;
+        }
+        if ((s & 31) == 0) con_putc('.');
+    }
+    con_write("\n", 0x0F);
+    ok("  [ok] kernel image written + verified\n");
+
+    con_write("installation complete - 'reboot' will boot from the disk\n",
+              0x0E);
 }
 
 static void cmd_echo(char *rest) {
@@ -561,9 +742,9 @@ static void cmd_rm(const char *name) {
 
 static const char *builtins[] = {
     "help", "clear", "meminfo", "tasks", "ps", "ls", "cat", "hexdump",
-    "run", "echo", "uptime", "gui", "about", "reboot",
+    "run", "echo", "uptime", "date", "gui", "about", "reboot",
     "stat", "df", "write", "append", "rm",
-    "net", "ping", "update", "version", NULL
+    "net", "ping", "update", "version", "pkg", "install", NULL
 };
 
 /* complete "cat rea<TAB>" -> "cat readme.txt" */
@@ -643,6 +824,10 @@ static void execute(char *cmdline) {
     else if (strcmp(c, "tasks")   == 0) cmd_tasks();
     else if (strcmp(c, "ps")      == 0) cmd_ps();
     else if (strcmp(c, "uptime")  == 0) cmd_uptime();
+    else if (strcmp(c, "date")    == 0) cmd_date();
+    else if (strcmp(c, "time")    == 0) cmd_date();
+    else if (strcmp(c, "pkg")     == 0) cmd_pkg(argc, argv);
+    else if (strcmp(c, "install") == 0) cmd_install();
     else if (strcmp(c, "net")     == 0) cmd_net();
     else if (strcmp(c, "ping")    == 0) cmd_ping(argc > 1 ? argv[1] : NULL);
     else if (strcmp(c, "update")  == 0) cmd_update();
